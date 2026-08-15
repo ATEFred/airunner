@@ -1,0 +1,896 @@
+#!/usr/bin/env python3
+"""
+Airunner — local model runner manager.
+
+Zero-dependency Python stdlib backend. Manages llama.cpp (llama-server) and
+DwarfStar (ds4-server) model processes: launch, stop, watch/restart, remember
+setups, autostart at boot (systemd user unit), and stream output to a web UI.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import shutil
+import uuid
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---------------------------------------------------------------------------
+# Paths / constants
+# ---------------------------------------------------------------------------
+
+APP_NAME = "airunner"
+STATE_DIR = os.path.expanduser("~/.local/share/airunner")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+SYSTEMD_UNIT = "airunner.service"
+SYSTEMD_DIR = os.path.expanduser("~/.config/systemd/user")
+
+DWARFSTAR_GGUF_DIR = "/home/fred/dwarfstar/gguf"
+
+DEFAULT_CONFIG = {
+    "llamacpp_bin": "/home/fred/ai/llama.cpp/build/bin/llama-server",
+    "dwarfstar_bin": "/home/fred/dwarfstar/ds4-server",
+    "strix_bin": "/home/fred/ai/strix-halo-llamacpp/build-vk/bin/llama-server",
+    "model_dirs": ["/home/fred/ai/models", DWARFSTAR_GGUF_DIR],
+    "host": "127.0.0.1",
+    "port": 8090,
+    "watchdog_interval": 5,
+}
+
+RUNNER_LABEL = {
+    "llamacpp": "llama.cpp (llama-server)",
+    "dwarfstar": "DwarfStar (ds4-server)",
+    "strix": "StrixHalo llama.cpp (Vulkan)",
+}
+
+# ---------------------------------------------------------------------------
+# Launch option knowledge base.
+#   Each option: {label, type, default, desc, suggested}
+#   type: int | float | str | flag | choice
+# ---------------------------------------------------------------------------
+
+LLAMACPP_OPTS = [
+    {"label": "-m, --model", "key": "model", "type": "str", "default": "",
+     "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "4096",
+     "desc": "Prompt context size (tokens)", "suggested": "8192"},
+    {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
+     "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
+    {"label": "-ngl, --n-gpu-layers", "key": "gpu_layers", "type": "int", "default": "-1",
+     "desc": "Layers to keep in VRAM (-1 = all, 0 = CPU only)", "suggested": "-1"},
+    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
+     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--port", "key": "port", "type": "int", "default": "8080",
+     "desc": "HTTP API port", "suggested": ""},
+    {"label": "--temp", "key": "temp", "type": "float", "default": "0.8",
+     "desc": "Sampling temperature", "suggested": "0.8"},
+    {"label": "--top-k", "key": "top_k", "type": "int", "default": "40",
+     "desc": "Top-k sampling (0 = disabled)", "suggested": "40"},
+    {"label": "--top-p", "key": "top_p", "type": "float", "default": "0.95",
+     "desc": "Top-p sampling", "suggested": "0.95"},
+    {"label": "--min-p", "key": "min_p", "type": "float", "default": "0.05",
+     "desc": "Min-p sampling", "suggested": "0.05"},
+    {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
+     "desc": "RNG seed (-1 = random)", "suggested": "-1"},
+    {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "auto",
+     "choices": ["auto", "on", "off"], "desc": "Use Flash Attention", "suggested": "auto"},
+    {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
+     "desc": "Number of parallel slots", "suggested": "1"},
+    {"label": "-a, --alias", "key": "alias", "type": "str", "default": "",
+     "desc": "Model alias used by the API", "suggested": ""},
+    {"label": "--chat-template-file", "key": "chat_template", "type": "str", "default": "",
+     "desc": "Path to a chat template .jinja file", "suggested": ""},
+    {"label": "--api-key", "key": "api_key", "type": "str", "default": "",
+     "desc": "API key for auth (optional)", "suggested": ""},
+    {"label": "--no-webui", "key": "no_webui", "type": "flag", "default": "off",
+     "desc": "Disable the built-in web UI", "suggested": "on"},
+    {"label": "--no-cache-prompt", "key": "no_cache_prompt", "type": "flag", "default": "off",
+     "desc": "Disable prompt caching", "suggested": "off"},
+    {"label": "--no-jinja", "key": "no_jinja", "type": "flag", "default": "off",
+     "desc": "Disable jinja chat template engine", "suggested": "off"},
+    {"label": "--metrics", "key": "metrics", "type": "flag", "default": "on",
+     "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
+]
+
+DWARFSTAR_OPTS = [
+    {"label": "-m, --model", "key": "model", "type": "str", "default": "",
+     "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "--backend", "key": "backend", "type": "choice", "default": "rocm",
+     "choices": ["metal", "rocm", "cpu"], "desc": "Compute backend", "suggested": "rocm"},
+    {"label": "-c, --ctx", "key": "ctx", "type": "int", "default": "65536",
+     "desc": "Allocated context tokens", "suggested": "65536"},
+    {"label": "-n, --tokens", "key": "tokens", "type": "int", "default": "",
+     "desc": "Default max output tokens when clients omit a limit (blank = server default, capped by ctx)", "suggested": ""},
+    {"label": "-t, --threads", "key": "threads", "type": "int", "default": str(min(32, os.cpu_count() or 4)),
+     "desc": "CPU helper threads for host-side work", "suggested": str(min(32, os.cpu_count() or 4))},
+    {"label": "--power", "key": "power", "type": "int", "default": "100",
+     "desc": "GPU duty-cycle target 1..100", "suggested": "100"},
+    {"label": "--ssd-streaming", "key": "ssd_streaming", "type": "flag", "default": "off",
+     "desc": "SSD-backed model streaming (avoid full RAM residency)", "suggested": "off"},
+    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
+     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--port", "key": "port", "type": "int", "default": "8000",
+     "desc": "HTTP API port", "suggested": ""},
+    {"label": "--cors", "key": "cors", "type": "flag", "default": "off",
+     "desc": "Add CORS headers for browser clients", "suggested": "off"},
+    {"label": "--kv-disk-dir", "key": "kv_disk_dir", "type": "str", "default": "~/.ds4/server-kv",
+     "desc": "Disk KV checkpoint directory (empty = disabled)", "suggested": "~/.ds4/server-kv"},
+    {"label": "--kv-disk-space-mb", "key": "kv_disk_space_mb", "type": "int", "default": "8192",
+     "desc": "Disk KV budget in MiB", "suggested": "8192"},
+    {"label": "--batched-session", "key": "batched_session", "type": "int", "default": "",
+     "desc": "Resident batched sessions (blank = server auto; forcing a high value multiplies KV-cache RAM and can OOM)", "suggested": ""},
+    {"label": "--mtp", "key": "mtp", "type": "str", "default": "",
+     "desc": "MTP/draft support GGUF (e.g. DSpark draft)", "suggested": ""},
+    {"label": "--mtp-draft", "key": "mtp_draft", "type": "int", "default": "1",
+     "desc": "Max autoregressive MTP draft tokens", "suggested": "1"},
+    {"label": "--mtp-margin", "key": "mtp_margin", "type": "float", "default": "3",
+     "desc": "Verifier confidence margin for fast MTP acceptance", "suggested": "3"},
+    {"label": "--dspark", "key": "dspark", "type": "flag", "default": "off",
+     "desc": "Enable DSpark speculation with --mtp", "suggested": "off"},
+    {"label": "--dspark-confidence", "key": "dspark_confidence", "type": "float", "default": "",
+     "desc": "DSpark confidence pruning threshold 0..1 (blank = server default; only applies with --dspark)", "suggested": ""},
+    {"label": "--dspark-strict", "key": "dspark_strict", "type": "flag", "default": "off",
+     "desc": "Load DSpark support but keep target-only decode", "suggested": "off"},
+    {"label": "--glm-mtp", "key": "glm_mtp", "type": "flag", "default": "off",
+     "desc": "Enable integrated greedy GLM MTP speculation", "suggested": "off"},
+    {"label": "--glm-mtp-timing", "key": "glm_mtp_timing", "type": "flag", "default": "off",
+     "desc": "Enable GLM MTP and print acceptance/timing counters", "suggested": "off"},
+    {"label": "--warm-weights", "key": "warm_weights", "type": "flag", "default": "off",
+     "desc": "Touch mapped tensor pages at startup to reduce first-use stalls", "suggested": "off"},
+    {"label": "--quality", "key": "quality", "type": "flag", "default": "off",
+     "desc": "Prefer exact kernels where faster approximate paths exist", "suggested": "off"},
+    {"label": "--think", "key": "think", "type": "flag", "default": "off",
+     "desc": "Enable normal thinking mode", "suggested": "off"},
+]
+
+STRIX_OPTS = [
+    {"label": "-m, --model", "key": "model", "type": "str", "default": "",
+     "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "-md, --model-draft", "key": "model_draft", "type": "str", "default": "",
+     "desc": "Draft model for speculative decoding (e.g. DSpark drafter)", "suggested": ""},
+    {"label": "-ngl, --n-gpu-layers", "key": "gpu_layers", "type": "str", "default": "all",
+     "desc": "Layers to keep in VRAM (number, 'auto' or 'all')", "suggested": "all"},
+    {"label": "-ngld, --n-gpu-layers-draft", "key": "draft_gpu_layers", "type": "str", "default": "all",
+     "desc": "Layers of the draft model to keep in VRAM (number, 'auto' or 'all')", "suggested": "all"},
+    {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "on",
+     "choices": ["on", "off", "auto"], "desc": "Use Flash Attention", "suggested": "on"},
+    {"label": "-ctk, --cache-type-k", "key": "cache_type_k", "type": "choice", "default": "q8_0",
+     "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for K", "suggested": "q8_0"},
+    {"label": "-ctv, --cache-type-v", "key": "cache_type_v", "type": "choice", "default": "q8_0",
+     "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for V", "suggested": "q8_0"},
+    {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
+     "desc": "Prompt context size (tokens)", "suggested": "131072"},
+    {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
+     "desc": "Number of parallel slots", "suggested": "1"},
+    {"label": "-b, --batch-size", "key": "batch_size", "type": "int", "default": "2048",
+     "desc": "Logical batch size (prompt processing)", "suggested": "2048"},
+    {"label": "-ub, --ubatch-size", "key": "ubatch_size", "type": "int", "default": "2048",
+     "desc": "Micro batch size (physical batch)", "suggested": "2048"},
+    {"label": "--spec-type", "key": "spec_type", "type": "str", "default": "draft-dspark",
+     "desc": "Speculative decoding types (comma-separated, e.g. draft-dspark)", "suggested": "draft-dspark"},
+    {"label": "--spec-draft-n-max", "key": "spec_draft_n_max", "type": "int", "default": "64",
+     "desc": "Max draft tokens per speculative pass", "suggested": "64"},
+    {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
+     "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
+    {"label": "--temp", "key": "temp", "type": "float", "default": "0.8",
+     "desc": "Sampling temperature", "suggested": "0.6"},
+    {"label": "--top-k", "key": "top_k", "type": "int", "default": "40",
+     "desc": "Top-k sampling (0 = disabled)", "suggested": "40"},
+    {"label": "--top-p", "key": "top_p", "type": "float", "default": "0.95",
+     "desc": "Top-p sampling", "suggested": "0.95"},
+    {"label": "--min-p", "key": "min_p", "type": "float", "default": "0.05",
+     "desc": "Min-p sampling", "suggested": "0.05"},
+    {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
+     "desc": "RNG seed (-1 = random)", "suggested": "-1"},
+    {"label": "--jinja", "key": "jinja", "type": "flag", "default": "on",
+     "desc": "Enable jinja chat template engine", "suggested": "on"},
+    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
+     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--port", "key": "port", "type": "int", "default": "8080",
+     "desc": "HTTP API port", "suggested": ""},
+    {"label": "--no-webui", "key": "no_webui", "type": "flag", "default": "off",
+     "desc": "Disable the built-in web UI", "suggested": "on"},
+    {"label": "--metrics", "key": "metrics", "type": "flag", "default": "on",
+     "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
+]
+
+RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS}
+
+
+# ---------------------------------------------------------------------------
+# Per-model default sampling/launch settings.
+#   Keyed by a substring of the model filename; values are option-key overrides
+#   per runner. The local GGUF files are future/fictional releases, so each is
+#   mapped to its closest real published sibling and that sibling's officially
+#   recommended defaults (temperature, top-k/top-p/min-p, ctx).
+#     qwen3.5/qwen3.6 -> Qwen3   (temp 0.6, top-k 20, top-p 0.95, min-p 0, ctx 40K)
+#     deepseek        -> DeepSeek-R1/V3 (temp 0.6, top-p 0.95)
+#     gemma           -> Gemma 3 instruct (temp 0.9, top-k 40, top-p 0.95)
+#     minimax         -> MiniMax M1 reasoning (temp 0.5, top-p 0.95)
+# ---------------------------------------------------------------------------
+
+MODEL_FAMILY_DEFAULTS = {
+    "qwen3.5": {
+        "llamacpp": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
+        "strix": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
+        "dwarfstar": {"ctx": "40960"},
+    },
+    "qwen3.6": {
+        "llamacpp": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
+        "strix": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
+        "dwarfstar": {"ctx": "40960"},
+    },
+    "deepseek": {
+        "llamacpp": {"temp": "0.6", "top_p": "0.95", "min_p": "0"},
+        "strix": {"temp": "0.6", "top_p": "0.95", "min_p": "0", "ctx_size": "131072", "cache_type_k": "q8_0", "cache_type_v": "q8_0", "spec_type": "draft-dspark", "spec_draft_n_max": "64"},
+        "dwarfstar": {},
+    },
+    "gemma": {
+        "llamacpp": {"temp": "0.9", "top_k": "40", "top_p": "0.95", "min_p": "0"},
+        "strix": {"temp": "0.9", "top_k": "40", "top_p": "0.95", "min_p": "0"},
+        "dwarfstar": {},
+    },
+    "minimax": {
+        "llamacpp": {"temp": "0.5", "top_p": "0.95", "min_p": "0"},
+        "strix": {"temp": "0.5", "top_p": "0.95", "min_p": "0"},
+        "dwarfstar": {},
+    },
+}
+
+
+def model_family_of(model_path):
+    name = os.path.basename(model_path).lower()
+    if any(tok in name for tok in ("mtp", "draft", "dspark")):
+        return None
+    for fam in MODEL_FAMILY_DEFAULTS:
+        if fam in name:
+            return fam
+    return None
+
+
+def model_defaults_for(models):
+    """Return {model_path: {runner: {key: value}}} for each discovered model."""
+    out = {}
+    for m in models:
+        fam = model_family_of(m)
+        if fam:
+            out[m] = MODEL_FAMILY_DEFAULTS[fam]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-runner model compatibility.
+#   Only models physically located in the DwarfStar gguf dir are DwarfStar
+#   compatible; everything else (incl. the Unsloth DeepSeek files in
+#   /home/fred/ai/models) is a llama.cpp model.
+# ---------------------------------------------------------------------------
+
+def model_runner_of(model_path):
+    if os.path.dirname(os.path.abspath(model_path)) == os.path.abspath(DWARFSTAR_GGUF_DIR):
+        return ["dwarfstar"]
+    # everything else is a llama.cpp-family model: usable by both mainline and the
+    # StrixHalo Vulkan fork
+    return ["llamacpp", "strix"]
+
+
+def option_cli_args(runner, opts):
+    """Convert {key: value} option dict to CLI argument list."""
+    args = []
+    for o in RUNNER_OPTS[runner]:
+        key = o["key"]
+        if key not in opts:
+            continue
+        v = opts[key]
+        if v is None or v == "":
+            continue
+        if o["type"] == "flag":
+            if str(v).lower() in ("on", "true", "1", "yes"):
+                args.append(o["label"].split(",")[-1].strip())
+            continue
+        args.append(o["label"].split(",")[-1].strip())
+        args.append(str(v))
+    return args
+
+
+def port_opt_key(runner):
+    for o in RUNNER_OPTS[runner]:
+        if o["label"].split(",")[-1].strip() == "--port":
+            return o["key"]
+    return None
+
+
+def find_free_port(requested, tries=100):
+    """Return the first free port starting at requested (or next free if taken)."""
+    port = requested
+    for _ in range(tries):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+            s.close()
+            return port
+        except OSError:
+            s.close()
+            port += 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# State store
+# ---------------------------------------------------------------------------
+
+class StateStore:
+    def __init__(self, path=STATE_FILE):
+        self.path = path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"config": DEFAULT_CONFIG, "setups": []}
+
+    def save(self):
+        with self.lock:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+
+    def get(self, key, default=None):
+        with self.lock:
+            return self.data.get(key, default)
+
+    def set(self, key, value):
+        with self.lock:
+            self.data[key] = value
+        self.save()
+
+
+# ---------------------------------------------------------------------------
+# Process manager
+# ---------------------------------------------------------------------------
+
+class Process:
+    def __init__(self, pid, setup):
+        self.id = uuid.uuid4().hex[:12]
+        self.pid = pid
+        self.stdout = None
+        self.reader = None
+        self.dead = False
+        self.setup = setup
+        self.start_time = time.time()
+        self.status = "running"  # running | crashed | stopped | restarting
+        self.exit_code = None
+        self.log = deque(maxlen=2000)
+        self.restarts = 0
+        self.started_by_watchdog = False
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "pid": self.pid,
+            "name": self.setup.get("name") or os.path.basename(self.setup.get("model", "")),
+            "runner": self.setup.get("runner"),
+            "model": self.setup.get("model"),
+            "port": self.setup.get("port") or "",
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "start_time": self.start_time,
+            "uptime": round(time.time() - self.start_time, 1),
+            "restarts": self.restarts,
+            "setup_id": self.setup.get("id", ""),
+            "log": list(self.log)[-400:],
+        }
+
+
+class ProcessManager:
+    def __init__(self, store, cfg):
+        self.store = store
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.procs = {}  # id -> Process
+        self.readers = {}  # pid -> reader thread
+        self.stop_flags = set()  # pids intentionally stopped
+        self.watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+
+    def _bin_for(self, runner):
+        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"]}[runner]
+
+    def _reader(self, pid, proc):
+        try:
+            for line in proc.stdout:
+                proc.log.append(line.rstrip("\n"))
+        except Exception:
+            pass
+        # EOF => process exited; reap it so the watchdog can detect the exit
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+        proc.dead = True
+
+    def start(self, setup):
+        runner = setup["runner"]
+        binary = self._bin_for(runner)
+        model = setup.get("model", "")
+        args = [binary]
+        if model:
+            args.append("-m")
+            args.append(model)
+        args += option_cli_args(runner, setup.get("options", {}))
+        # --- port conflict handling: if requested port is taken, auto-pick a free one ---
+        pk = port_opt_key(runner)
+        port_note = ""
+        if pk is not None:
+            req = setup.get("options", {}).get(pk, "")
+            if req:
+                free = find_free_port(int(req))
+                if free != int(req):
+                    setup.setdefault("options", {})[pk] = str(free)
+                    # rewrite the --port value already in args
+                    try:
+                        i = args.index("--port")
+                        args[i + 1] = str(free)
+                    except (ValueError, IndexError):
+                        pass
+                    port_note = f"[airunner] port {req} in use; using {free} instead"
+        # ensure port option applied for bookkeeping
+        port = ""
+        for o in RUNNER_OPTS[runner]:
+            if o["label"].split(",")[-1].strip() == "--port":
+                port = setup.get("options", {}).get(o["key"], "")
+                break
+        proc = None
+        with self.lock:
+            proc = Process(None, setup)
+            proc.setup["port"] = port or ""
+            self.procs[proc.id] = proc
+        env = dict(os.environ)
+        env["LLAMA_ARG_CTX_SIZE"] = str(setup.get("options", {}).get("ctx_size", ""))
+        try:
+            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, env=env)
+            proc.pid = p.pid
+            proc.stdout = p.stdout
+            proc.log.append("$ " + " ".join(args))
+            if port_note:
+                proc.log.append(port_note)
+            r = threading.Thread(target=self._reader, args=(p.pid, proc), daemon=True)
+            proc.reader = r
+            self.readers[p.pid] = r
+            r.start()
+        except Exception as e:
+            proc.status = "crashed"
+            proc.log.append(f"[airunner] failed to launch: {e}")
+        return proc
+
+    def stop(self, pid):
+        with self.lock:
+            proc = self.procs.get(pid)
+            if not proc:
+                return False
+            self.stop_flags.add(proc.pid)
+            pidv = proc.pid
+        if pidv is None:
+            proc.status = "stopped"
+            return True
+        # Kill in the background so the HTTP request returns immediately.
+        # Send SIGINT (same as Ctrl+C, which DwarfStar handles instantly),
+        # then escalate to SIGKILL if it does not exit.
+        def _kill():
+            try:
+                os.kill(pidv, 2)  # SIGINT
+            except Exception:
+                pass
+            for _ in range(50):  # up to ~5s grace for e.g. KV cache flush to disk
+                try:
+                    os.kill(pidv, 0)
+                except OSError:
+                    proc.status = "stopped"
+                    return
+                except Exception:
+                    proc.status = "stopped"
+                    return
+                time.sleep(0.1)
+            try:
+                os.kill(pidv, 9)  # SIGKILL fallback
+            except Exception:
+                pass
+            proc.status = "stopped"
+        threading.Thread(target=_kill, daemon=True).start()
+        return True
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(max(1, int(self.cfg.get("watchdog_interval", 5))))
+            self._watchdog_tick()
+
+    def _watchdog_tick(self):
+        snapshot = []
+        with self.lock:
+            snapshot = [(pid, p) for pid, p in self.procs.items()]
+        for pid, proc in snapshot:
+            alive = True
+            if proc.pid is not None:
+                if proc.reader is not None:
+                    alive = proc.reader.is_alive()
+                else:
+                    alive = self._alive(proc.pid)
+            if alive:
+                continue
+            if proc.pid in self.stop_flags:
+                continue
+            # crashed unexpectedly
+            rc = self._exit_code(proc.pid) if proc.pid else None
+            proc.status = "crashed"
+            proc.exit_code = rc
+            if proc.setup.get("restart_on_crash", False) and not proc.setup.get("autostart_only_once", False):
+                proc.restarts += 1
+                proc.status = "restarting"
+                proc.log.append(f"[airunner] process died (rc={rc}); restarting ({proc.restarts})")
+                new = self.start(proc.setup)
+                if new:
+                    # carry restart count across the fresh Process record
+                    new.restarts = proc.restarts
+                    with self.lock:
+                        self.procs.pop(pid, None)
+                        self.procs[new.id] = new
+                continue
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _exit_code(pid):
+        try:
+            w = os.waitpid(pid, os.WNOHANG)
+            if w[0] == 0:
+                return None
+            return (w[1] & 0xFF) >> 8
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Autostart / systemd
+# ---------------------------------------------------------------------------
+
+def systemd_unit_path():
+    return os.path.join(SYSTEMD_DIR, SYSTEMD_UNIT)
+
+
+def systemd_installed():
+    return os.path.exists(systemd_unit_path())
+
+
+def install_systemd(app_path):
+    os.makedirs(SYSTEMD_DIR, exist_ok=True)
+    unit = f"""[Unit]
+Description=Airunner - local model runner manager
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {app_path}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+    with open(systemd_unit_path(), "w") as f:
+        f.write(unit)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "enable", SYSTEMD_UNIT], capture_output=True)
+    subprocess.run(["systemctl", "--user", "restart", SYSTEMD_UNIT], capture_output=True)
+
+
+def remove_systemd():
+    subprocess.run(["systemctl", "--user", "disable", SYSTEMD_UNIT], capture_output=True)
+    if os.path.exists(systemd_unit_path()):
+        os.remove(systemd_unit_path())
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+
+def service_status():
+    try:
+        out = subprocess.run(["systemctl", "--user", "is-active", SYSTEMD_UNIT],
+                             capture_output=True, text=True).stdout.strip()
+        return out
+    except Exception:
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Model discovery
+# ---------------------------------------------------------------------------
+
+def discover_models(dirs):
+    found = []
+    for d in dirs or []:
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name.lower().endswith(".gguf"):
+                found.append(os.path.join(d, name))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# HTTP API
+# ---------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    server = None  # set on server instance
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length", 0))
+        if n == 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def do_OPTIONS(self):
+        self._send(200, b"", "text/plain")
+
+    def do_GET(self):
+        route = self.path.split("?", 1)[0]
+        if route == "/":
+            return self._serve_index()
+        api = self.server.api
+        if route == "/api/state":
+            return self._send(200, api.state())
+        if route == "/api/models":
+            return self._send(200, {"models": discover_models(api.cfg.get("model_dirs", []))})
+        if route == "/api/config":
+            return self._send(200, api.cfg)
+        if route == "/api/setups":
+            return self._send(200, {"setups": api.store.get("setups", [])})
+        if route == "/api/launch-options":
+            runner = self._query("runner") or "llamacpp"
+            return self._send(200, {"options": RUNNER_OPTS.get(runner, []), "runner": runner})
+        if route == "/api/systemd":
+            return self._send(200, {"installed": systemd_installed(),
+                                    "active": service_status()})
+        self._send(404, {"error": "not found"})
+
+    def _query(self, key):
+        from urllib.parse import parse_qs
+        qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        return qs.get(key, [""])[0]
+
+    def _serve_index(self):
+        try:
+            with open(os.path.join(WEB_DIR, "index.html")) as f:
+                html = f.read()
+            self._send(200, html.encode(), "text/html")
+        except Exception as e:
+            self._send(500, {"error": str(e)}, "application/json")
+
+    def do_POST(self):
+        route = self.path.split("?", 1)[0]
+        api = self.server.api
+        if route == "/api/remove":
+            body = self._read_json()
+            api.remove_proc(body.get("id", ""))
+            return self._send(200, {"ok": True})
+        if route == "/api/run":
+            body = self._read_json()
+            setup = body.get("setup", {})
+            runner = setup.get("runner", "llamacpp")
+            if runner not in RUNNER_OPTS:
+                return self._send(400, {"error": f"unknown runner {runner}"})
+            model = setup.get("model", "")
+            if model and not os.path.exists(model):
+                return self._send(400, {"error": f"model not found: {model}"})
+            proc = api.pm.start(setup)
+            return self._send(200, {"proc": proc.to_dict()})
+        if route == "/api/stop":
+            body = self._read_json()
+            ok = api.pm.stop(body.get("id", ""))
+            return self._send(200, {"ok": ok})
+        if route == "/api/restart":
+            body = self._read_json()
+            return self._send(200, api.restart_proc(body.get("id", "")))
+        if route == "/api/save-setup":
+            body = self._read_json()
+            return self._send(200, api.save_setup(body))
+        if route == "/api/apply-setup":
+            body = self._read_json()
+            return self._send(200, api.apply_setup(body))
+        if route == "/api/delete-setup":
+            body = self._read_json()
+            return self._send(200, api.delete_setup(body.get("id", "")))
+        if route == "/api/config":
+            body = self._read_json()
+            api.cfg.update({k: v for k, v in body.items() if k in DEFAULT_CONFIG})
+            api.store.set("config", api.cfg)
+            return self._send(200, api.cfg)
+        if route == "/api/systemd/install":
+            return self._send(200, api.install_systemd())
+        if route == "/api/systemd/remove":
+            return self._send(200, api.remove_systemd())
+        if route == "/api/autostart/start-all":
+            return self._send(200, api.start_autostart())
+        self._send(404, {"error": "not found"})
+
+    def do_PUT(self):
+        self.do_POST()
+
+    def do_DELETE(self):
+        route = self.path.split("?", 1)[0]
+        if route == "/api/delete-setup":
+            api = self.server.api
+            sid = self._query("id")
+            return self._send(200, api.delete_setup(sid))
+        self._send(404, {"error": "not found"})
+
+
+class API:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.store = StateStore()
+        self.pm = ProcessManager(self.store, cfg)
+        self.pm.watchdog.start()
+        self._boot_autostart()
+
+    def state(self):
+        procs = []
+        with self.pm.lock:
+            procs = [p.to_dict() for p in self.pm.procs.values()]
+        models = discover_models(self.cfg.get("model_dirs", []))
+        return {
+            "config": self.cfg,
+            "setups": self.store.get("setups", []),
+            "procs": procs,
+            "systemd": {"installed": systemd_installed(), "active": service_status()},
+            "models": models,
+            "runners": RUNNER_LABEL,
+            "options": RUNNER_OPTS,
+            "model_defaults": model_defaults_for(models),
+            "model_runners": {m: model_runner_of(m) for m in models},
+        }
+
+    def save_setup(self, body):
+        setups = self.store.get("setups", [])
+        sid = body.get("id")
+        if sid:
+            setups = [s for s in setups if s.get("id") != sid]
+        else:
+            body["id"] = uuid.uuid4().hex[:12]
+        body.setdefault("created", time.time())
+        setups.append(body)
+        self.store.set("setups", setups)
+        return {"ok": True, "setup": body}
+
+    def delete_setup(self, sid):
+        setups = self.store.get("setups", [])
+        setups = [s for s in setups if s.get("id") != sid]
+        self.store.set("setups", setups)
+        return {"ok": True}
+
+    def remove_proc(self, pid):
+        with self.pm.lock:
+            self.pm.procs.pop(pid, None)
+        return {"ok": True}
+
+    def restart_proc(self, pid):
+        with self.pm.lock:
+            proc = self.pm.procs.get(pid)
+        if not proc:
+            return {"error": "not found"}
+        new = self.pm.start(proc.setup)
+        if not new:
+            return {"error": "failed to start"}
+        with self.pm.lock:
+            self.pm.procs.pop(pid, None)
+            self.pm.procs[new.id] = new
+        return {"proc": new.to_dict()}
+
+    def apply_setup(self, body):
+        setups = self.store.get("setups", [])
+        sid = body.get("id")
+        setup = next((s for s in setups if s.get("id") == sid), None)
+        if not setup:
+            return {"error": "setup not found"}
+        proc = self.pm.start(setup)
+        return {"ok": True, "proc": proc.to_dict()}
+
+    def install_systemd(self):
+        app_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "airunner.py"))
+        install_systemd(app_path)
+        return {"installed": True, "active": service_status()}
+
+    def remove_systemd(self):
+        remove_systemd()
+        return {"installed": False}
+
+    def start_autostart(self):
+        started = []
+        for s in self.store.get("setups", []):
+            if s.get("autostart"):
+                proc = self.pm.start(s)
+                started.append(proc.to_dict())
+        return {"ok": True, "started": started}
+
+    def _boot_autostart(self):
+        for s in self.store.get("setups", []):
+            if s.get("autostart"):
+                try:
+                    self.pm.start(s)
+                except Exception:
+                    pass
+
+
+def main():
+    cfg = dict(DEFAULT_CONFIG)
+    # merge saved config
+    store = StateStore()
+    saved = store.get("config", {})
+    cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
+    # always scan the DwarfStar gguf dir so its models show up
+    if DWARFSTAR_GGUF_DIR not in cfg["model_dirs"]:
+        cfg["model_dirs"].append(DWARFSTAR_GGUF_DIR)
+    # CLI overrides
+    import argparse
+    ap = argparse.ArgumentParser(description="Airunner local model manager")
+    ap.add_argument("--host", help="listen host")
+    ap.add_argument("--port", type=int, help="listen port")
+    ap.add_argument("--llamacpp-bin", help="llama-server binary")
+    ap.add_argument("--dwarfstar-bin", help="ds4-server binary")
+    ap.add_argument("--strix-bin", help="StrixHalo llama.cpp (Vulkan) llama-server binary")
+    args = ap.parse_args()
+    if args.host:
+        cfg["host"] = args.host
+    if args.port:
+        cfg["port"] = args.port
+    if args.llamacpp_bin:
+        cfg["llamacpp_bin"] = args.llamacpp_bin
+    if args.dwarfstar_bin:
+        cfg["dwarfstar_bin"] = args.dwarfstar_bin
+    if args.strix_bin:
+        cfg["strix_bin"] = args.strix_bin
+
+    api = API(cfg)
+    server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)
+    server.api = api
+    print(f"airunner: web UI at http://{cfg['host']}:{cfg['port']}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

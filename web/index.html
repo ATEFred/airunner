@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airunner — local model manager</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1f2430; --border:#2c3242;
+    --text:#e6e8ee; --muted:#9aa1b2; --accent:#4f7cff; --green:#3fb950;
+    --red:#f0506e; --amber:#d4a72c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  header{display:flex;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{font-size:18px;margin:0}
+  header .spacer{flex:1}
+  .btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);
+       padding:6px 10px;border-radius:6px;cursor:pointer;font-size:13px}
+  .btn:hover{border-color:var(--accent)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.danger{background:var(--red);border-color:var(--red);color:#fff}
+  .btn.green{background:var(--green);border-color:var(--green);color:#fff}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  main{display:grid;grid-template-columns:minmax(420px,1fr) minmax(560px,1fr);gap:16px;padding:16px}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px}
+  .panel h2{font-size:14px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  label{display:block;font-size:12px;color:var(--muted);margin:8px 0 3px}
+  input,select,textarea{width:100%;background:var(--panel2);border:1px solid var(--border);
+        color:var(--text);padding:6px 8px;border-radius:6px;font-size:13px;font-family:inherit}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:8px;align-items:center}
+  .row.grow{flex:1}
+  .chk{display:inline-flex;align-items:center;gap:6px;margin:6px 10px 0 0;font-size:13px;color:var(--text)}
+  .chk input{width:auto}
+  .opt-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px 12px}
+  .opt-item .label{font-size:11px;color:var(--muted);margin-bottom:2px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;background:var(--panel2);color:var(--muted);margin-right:4px}
+  .badge.run{background:var(--green);color:#fff}
+  .badge.crash{background:var(--red);color:#fff}
+  .badge.restart{background:var(--amber);color:#000}
+  .badge.stop{background:var(--panel2);color:var(--muted)}
+  .model-list{display:flex;flex-wrap:wrap;gap:6px}
+  .model-chip{background:var(--panel2);border:1px solid var(--border);border-radius:6px;
+       padding:4px 8px;font-size:12px;cursor:pointer}
+  .model-chip:hover{border-color:var(--accent)}
+  .model-chip.selected{border-color:var(--accent);color:var(--accent)}
+  .console{background:#0b0d11;border:1px solid var(--border);border-radius:6px;
+       height:300px;overflow:auto;font-family:monospace;font-size:12px;padding:8px;white-space:pre-wrap;word-break:break-word}
+  .console .line{color:#c8d0e0}
+  .console .cmd{color:var(--accent)}
+  .proc-header{display:flex;align-items:center;gap:8px}
+  .proc-header .name{font-weight:600}
+  .meta{font-size:12px;color:var(--muted)}
+  .setup-item{background:var(--panel2);border:1px solid var(--border);border-radius:6px;
+       padding:8px;margin-bottom:6px}
+  .setup-item .meta{font-size:11px}
+  .setup-item .actions{display:flex;gap:6px;margin-top:6px}
+  .tag{font-size:11px;color:var(--muted)}
+  .hint{font-size:11px;color:var(--muted)}
+  .err{color:var(--red);font-size:12px;margin:6px 0}
+  .ok{color:var(--green);font-size:12px;margin:6px 0}
+  details summary{cursor:pointer;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Airunner</h1>
+  <span class="tag" id="sysd-tag"></span>
+  <span class="spacer"></span>
+  <button class="btn" id="btn-config">Config</button>
+  <button class="btn green" id="btn-autostart">Start autostart setups</button>
+  <button class="btn" id="btn-refresh">Refresh</button>
+</header>
+<main>
+  <div id="left">
+    <div class="panel" id="config-panel" style="display:none">
+      <h2>Configuration</h2>
+      <label>llama.cpp binary (llama-server)</label>
+      <input id="cfg-llamacpp" placeholder="/path/to/llama-server">
+      <label>DwarfStar binary (ds4-server)</label>
+      <input id="cfg-dwarfstar" placeholder="/path/to/ds4-server">
+      <label>StrixHalo llama.cpp binary (llama-server, Vulkan)</label>
+      <input id="cfg-strix" placeholder="/path/to/strix-halo llama-server">
+      <label>Model directories (comma-separated)</label>
+      <input id="cfg-models" placeholder="/path/to/models">
+      <div class="row">
+        <div class="grow"><label>Host</label><input id="cfg-host"></div>
+        <div class="grow"><label>Port</label><input id="cfg-port"></div>
+        <div class="grow"><label>Watchdog interval (s)</label><input id="cfg-wd"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="btn-savecfg">Save config</button>
+        <button class="btn" id="btn-sysd-install">Install autostart service</button>
+        <button class="btn danger" id="btn-sysd-remove">Remove service</button>
+      </div>
+      <div class="hint" id="cfg-hint"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Launch a model</h2>
+      <label>Runner</label>
+      <select id="runner">
+        <option value="llamacpp">llama.cpp (llama-server)</option>
+        <option value="strix">StrixHalo llama.cpp (Vulkan)</option>
+        <option value="dwarfstar">DwarfStar (ds4-server)</option>
+      </select>
+      <label>Model</label>
+      <div class="model-list" id="model-list"></div>
+      <label>Launch options</label>
+      <div class="opt-grid" id="opt-grid"></div>
+      <div class="row" style="margin-top:8px">
+        <div class="grow"><label>Port (bookkeeping)</label><input id="port" placeholder="auto"></div>
+      </div>
+      <div class="chk"><input type="checkbox" id="autostart"><label>Autostart at machine boot</label></div>
+      <div class="chk"><input type="checkbox" id="restart"><label>Restart if it crashes</label></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="btn-run">Run now</button>
+        <button class="btn" id="btn-save">Save setup</button>
+      </div>
+      <div id="launch-msg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Saved setups (past runs)</h2>
+      <div id="setup-list"></div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="panel">
+      <h2>Running models</h2>
+      <div id="procs"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let state = null;
+let selectedModel = "";
+let optVals = {};
+
+async function j(url, method="GET", body=null){
+  const r = await fetch(url, {method, headers:{"Content-Type":"application/json"},
+      body: body?JSON.stringify(body):null});
+  return r.json();
+}
+
+function runnerOpts(runner){
+  const opts = state.options[runner] || [];
+  return opts;
+}
+
+function renderModels(){
+  const runner = $("runner").value;
+  const list = $("model-list");
+  list.innerHTML = "";
+  const models = (state.models||[]).filter(m => (state.model_runners[m]||[]).includes(runner));
+  if(selectedModel && !models.includes(selectedModel)) selectedModel = "";
+  if(!selectedModel && models.length) selectedModel = models[0];
+  models.forEach(m => {
+    const chip = document.createElement("div");
+    chip.className = "model-chip" + (m===selectedModel?" selected":"");
+    chip.textContent = m.split("/").pop();
+    chip.title = m;
+    chip.onclick = () => { selectedModel = m; optVals = {}; renderModels(); renderOptions(); };
+    list.appendChild(chip);
+  });
+}
+
+function renderOptions(){
+  const runner = $("runner").value;
+  const grid = $("opt-grid");
+  grid.innerHTML = "";
+  const opts = runnerOpts(runner);
+  // per-model defaults for the currently selected model (fresh setups only)
+  const md = state.model_defaults && state.model_defaults[selectedModel] || {};
+  const mdr = md[runner] || {};
+  opts.forEach(o => {
+    const item = document.createElement("div");
+    item.className = "opt-item";
+    item.innerHTML = `<div class="label" title="${o.desc}">${o.label} <span class="tag">${o.type}</span></div>`;
+    const val = optVals[runner] && optVals[runner][o.key] != null ? optVals[runner][o.key] : (mdr[o.key] != null ? mdr[o.key] : o.default);
+    optVals[runner] = optVals[runner] || {};
+    optVals[runner][o.key] = val;
+    // MTP/draft support GGUF -> dropdown of candidate files
+    if(o.key === "mtp" || o.key === "model_draft"){
+      const s = document.createElement("select");
+      const opt = document.createElement("option"); opt.value=""; opt.textContent="(none)"; s.appendChild(opt);
+      const runnerModels = (state.models||[]).filter(m => (state.model_runners[m]||[]).includes(runner));
+      const candidates = runnerModels.filter(m => /mtp|draft|dspark/i.test(m.split("/").pop()));
+      const pool = candidates.length ? candidates : runnerModels;
+      pool.forEach(m => {
+        const op = document.createElement("option");
+        op.value = m; op.textContent = m.split("/").pop();
+        if(m === val) op.selected = true;
+        s.appendChild(op);
+      });
+      s.onchange = () => { optVals[runner][o.key] = s.value; };
+      item.appendChild(s);
+      grid.appendChild(item);
+      return;
+    }
+    if(o.type === "flag"){
+      const c = document.createElement("div");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = String(val).toLowerCase() === "on";
+      input.onchange = () => { optVals[runner] = optVals[runner]||{}; optVals[runner][o.key] = input.checked?"on":"off"; };
+      const lab = document.createElement("label");
+      lab.textContent = " enabled";
+      c.append(input, lab);
+      item.appendChild(c);
+    } else if(o.type === "choice"){
+      const s = document.createElement("select");
+      (o.choices||[]).forEach(ch => {
+        const op = document.createElement("option");
+        op.value = ch; op.textContent = ch;
+        if(ch === val) op.selected = true;
+        s.appendChild(op);
+      });
+      s.onchange = () => { optVals[runner] = optVals[runner]||{}; optVals[runner][o.key] = s.value; };
+      item.appendChild(s);
+    } else {
+      const input = document.createElement("input");
+      input.type = o.type === "int" ? "number" : o.type === "float" ? "number" : "text";
+      input.step = o.type === "float" ? "0.01" : "1";
+      input.value = val;
+      input.placeholder = o.suggested ? `suggested: ${o.suggested}` : "";
+      input.onchange = () => { optVals[runner] = optVals[runner]||{}; optVals[runner][o.key] = input.value; };
+      item.appendChild(input);
+    }
+    grid.appendChild(item);
+  });
+}
+
+function buildSetup(){
+  const runner = $("runner").value;
+  const opts = {};
+  runnerOpts(runner).forEach(o => {
+    if(optVals[runner] && optVals[runner][o.key] != null) opts[o.key] = optVals[runner][o.key];
+  });
+  return {
+    runner, model: selectedModel, options: opts,
+    autostart: $("autostart").checked,
+    restart_on_crash: $("restart").checked,
+    port: $("port").value,
+  };
+}
+
+function renderProcs(){
+  const box = $("procs");
+  // capture scroll position of existing consoles before rebuilding
+  const scrollState = {};
+  box.querySelectorAll(".console").forEach(c => {
+    scrollState[c.id] = {
+      top: c.scrollTop,
+      atBottom: c.scrollHeight - c.scrollTop - c.clientHeight < 30,
+    };
+  });
+  box.innerHTML = "";
+  (state.procs||[]).forEach(p => {
+    const el = document.createElement("div");
+    el.className = "panel";
+    const name = document.createElement("div");
+    name.className = "proc-header";
+    name.innerHTML = `<span class="name">${esc(p.name)}</span>
+      <span class="badge ${p.status}">${p.status}</span>
+      <span class="meta">pid ${p.pid} · runner ${p.runner} · ${p.uptime}s · restarts ${p.restarts}</span>`;
+    const console = document.createElement("div");
+    console.className = "console";
+    console.id = "console-"+p.id;
+    console.innerHTML = (p.log||[]).map(l => {
+      const isCmd = l.startsWith("$ ");
+      return `<span class="${isCmd?'cmd':'line'}">${esc(l)}</span>\n`;
+    }).join("");
+    const actions = document.createElement("div");
+    actions.className = "row";
+    actions.style.marginTop = "6px";
+    if(p.status === "stopped" || p.status === "crashed"){
+      const start = document.createElement("button");
+      start.className = "btn green";
+      start.textContent = "Start";
+      start.onclick = () => j("/api/restart", "POST", {id: p.id}).then(refresh);
+      actions.appendChild(start);
+      const rm = document.createElement("button");
+      rm.className = "btn";
+      rm.textContent = "Remove";
+      rm.onclick = () => j("/api/remove", "POST", {id: p.id}).then(refresh);
+      actions.appendChild(rm);
+    } else {
+      const stop = document.createElement("button");
+      stop.className = "btn danger";
+      stop.textContent = "Stop";
+      stop.onclick = () => j("/api/stop", "POST", {id: p.id}).then(refresh);
+      actions.appendChild(stop);
+    }
+    el.append(name, console, actions);
+    box.appendChild(el);
+  });
+  // restore scroll after layout: stay pinned to bottom unless the user scrolled up
+  requestAnimationFrame(() => {
+    box.querySelectorAll(".console").forEach(c => {
+      const ss = scrollState[c.id];
+      if(ss){
+        if(ss.atBottom){
+          c.scrollTop = c.scrollHeight;
+        } else {
+          c.scrollTop = ss.top;
+        }
+      } else {
+        c.scrollTop = c.scrollHeight;
+      }
+    });
+  });
+  if(!(state.procs||[]).length){
+    box.innerHTML = `<div class="hint">No models running. Launch one on the left.</div>`;
+  }
+}
+
+function renderSetups(){
+  const box = $("setup-list");
+  box.innerHTML = "";
+  (state.setups||[]).forEach(s => {
+    const el = document.createElement("div");
+    el.className = "setup-item";
+    const name = s.name || (s.model? s.model.split("/").pop() : "unnamed");
+    const flags = (s.autostart?"autostart ":"") + (s.restart_on_crash?"watchdog":"");
+    el.innerHTML = `<div><b>${esc(name)}</b> <span class="badge">${s.runner}</span>
+        <span class="tag">${flags}</span></div>
+        <div class="meta">${esc(s.model||"")} · port ${esc(s.port||"-")}</div>`;
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const apply = document.createElement("button");
+    apply.className = "btn primary"; apply.textContent = "Run";
+    apply.onclick = () => j("/api/apply-setup", "POST", {id: s.id}).then(refresh);
+    const del = document.createElement("button");
+    del.className = "btn danger"; del.textContent = "Delete";
+    del.onclick = () => j("/api/delete-setup", "POST", {id: s.id}).then(refresh);
+    actions.append(apply, del);
+    el.appendChild(actions);
+    box.appendChild(el);
+  });
+  if(!(state.setups||[]).length){
+    box.innerHTML = `<div class="hint">No saved setups yet. Configure a model and hit "Save setup".</div>`;
+  }
+}
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({'&':'&','<':'<','>':'>'}[c])); }
+
+async function refresh(){
+  state = await j("/api/state");
+  renderModels();
+  renderOptions();
+  renderProcs();
+  renderSetups();
+  $("sysd-tag").textContent = state.systemd.installed ?
+      `autostart service: ${state.systemd.active}` : "autostart service: not installed";
+  $("cfg-llamacpp").value = state.config.llamacpp_bin || "";
+  $("cfg-dwarfstar").value = state.config.dwarfstar_bin || "";
+  $("cfg-strix").value = state.config.strix_bin || "";
+  $("cfg-models").value = (state.config.model_dirs||[]).join(", ");
+  $("cfg-host").value = state.config.host || "";
+  $("cfg-port").value = state.config.port || "";
+  $("cfg-wd").value = state.config.watchdog_interval || 5;
+}
+
+async function poll(){
+  try { state = await j("/api/state"); renderProcs(); }
+  catch(e){}
+  setTimeout(poll, 2000);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("btn-refresh").onclick = refresh;
+  $("runner").onchange = () => { renderModels(); renderOptions(); };
+  $("btn-run").onclick = async () => {
+    const setup = buildSetup();
+    setup.name = setup.model ? setup.model.split("/").pop() : "unnamed";
+    const r = await j("/api/run", "POST", {setup});
+    if(r.error){ $("launch-msg").innerHTML = `<div class="err">${esc(r.error)}</div>`; }
+    else { $("launch-msg").innerHTML = `<div class="ok">launched ${esc(r.proc.name)}</div>`; refresh(); }
+  };
+  $("btn-save").onclick = async () => {
+    const setup = buildSetup();
+    const nm = prompt("Name this setup", setup.model ? setup.model.split("/").pop() : "unnamed");
+    if(nm == null) return;
+    setup.name = nm;
+    const r = await j("/api/save-setup", "POST", setup);
+    if(r.error){ $("launch-msg").innerHTML = `<div class="err">${esc(r.error)}</div>`; }
+    else { $("launch-msg").innerHTML = `<div class="ok">setup saved</div>`; refresh(); }
+  };
+  $("btn-savecfg").onclick = async () => {
+    const cfg = {
+      llamacpp_bin: $("cfg-llamacpp").value.trim(),
+      dwarfstar_bin: $("cfg-dwarfstar").value.trim(),
+      strix_bin: $("cfg-strix").value.trim(),
+      model_dirs: $("cfg-models").value.split(",").map(s=>s.trim()).filter(Boolean),
+      host: $("cfg-host").value.trim(), port: parseInt($("cfg-port").value)||8090,
+      watchdog_interval: parseInt($("cfg-wd").value)||5,
+    };
+    const r = await j("/api/config", "POST", cfg);
+    $("cfg-hint").innerHTML = `<div class="ok">config saved</div>`;
+    refresh();
+  };
+  $("btn-sysd-install").onclick = async () => {
+    const r = await j("/api/systemd/install", "POST");
+    refresh();
+  };
+  $("btn-sysd-remove").onclick = async () => {
+    const r = await j("/api/systemd/remove", "POST");
+    refresh();
+  };
+  $("btn-autostart").onclick = async () => {
+    const r = await j("/api/autostart/start-all", "POST");
+    refresh();
+  };
+  $("btn-config").onclick = () => {
+    $("config-panel").style.display = $("config-panel").style.display === "none" ? "" : "none";
+  };
+  refresh();
+  poll();
+});
+</script>
+</body>
+</html>
