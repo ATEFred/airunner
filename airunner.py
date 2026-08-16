@@ -754,6 +754,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/delete-setup":
             body = self._read_json()
             return self._send(200, api.delete_setup(body.get("id", "")))
+        if route == "/api/setup-autostart":
+            body = self._read_json()
+            return self._send(200, api.set_setup_autostart(body))
         if route == "/api/config":
             body = self._read_json()
             api.cfg.update({k: v for k, v in body.items() if k in DEFAULT_CONFIG})
@@ -821,6 +824,16 @@ class API:
         setups = [s for s in setups if s.get("id") != sid]
         self.store.set("setups", setups)
         return {"ok": True}
+
+    def set_setup_autostart(self, body):
+        setups = self.store.get("setups", [])
+        sid = body.get("id")
+        setup = next((s for s in setups if s.get("id") == sid), None)
+        if not setup:
+            return {"error": "setup not found"}
+        setup["autostart"] = bool(body.get("autostart"))
+        self.store.set("setups", setups)
+        return {"ok": True, "setup": setup}
 
     def remove_proc(self, pid):
         with self.pm.lock:

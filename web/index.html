@@ -336,16 +336,40 @@ function renderSetups(){
     const apply = document.createElement("button");
     apply.className = "btn primary"; apply.textContent = "Run";
     apply.onclick = () => j("/api/apply-setup", "POST", {id: s.id}).then(refresh);
+    const clone = document.createElement("button");
+    clone.className = "btn"; clone.textContent = "Clone";
+    clone.onclick = () => cloneSetup(s);
     const del = document.createElement("button");
     del.className = "btn danger"; del.textContent = "Delete";
     del.onclick = () => j("/api/delete-setup", "POST", {id: s.id}).then(refresh);
-    actions.append(apply, del);
+    actions.append(apply, clone, del);
+    const autochk = document.createElement("label");
+    autochk.className = "chk";
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.checked = !!s.autostart;
+    chk.onchange = () => j("/api/setup-autostart", "POST", {id: s.id, autostart: chk.checked}).then(refresh);
+    autochk.append(chk, document.createTextNode("autostart"));
+    actions.appendChild(autochk);
     el.appendChild(actions);
     box.appendChild(el);
   });
   if(!(state.setups||[]).length){
     box.innerHTML = `<div class="hint">No saved setups yet. Configure a model and hit "Save setup".</div>`;
   }
+}
+
+function cloneSetup(s){
+  $("runner").value = s.runner;
+  selectedModel = s.model;
+  optVals = {};
+  optVals[s.runner] = {...(s.options||{})};
+  $("port").value = s.port || "";
+  $("autostart").checked = !!s.autostart;
+  $("restart").checked = !!s.restart_on_crash;
+  renderModels();
+  renderOptions();
+  $("launch-msg").innerHTML = `<div class="ok">cloned setup into form</div>`;
 }
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({'&':'&','<':'<','>':'>'}[c])); }
