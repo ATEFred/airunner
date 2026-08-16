@@ -57,14 +57,14 @@ RUNNER_LABEL = {
 LLAMACPP_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
-    {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "4096",
-     "desc": "Prompt context size (tokens)", "suggested": "8192"},
+    {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
+     "desc": "Prompt context size (tokens)", "suggested": "131072"},
     {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
      "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
     {"label": "-ngl, --n-gpu-layers", "key": "gpu_layers", "type": "int", "default": "-1",
      "desc": "Layers to keep in VRAM (-1 = all, 0 = CPU only)", "suggested": "-1"},
-    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
-     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--host", "key": "host", "type": "str", "default": "0.0.0.0",
+     "desc": "Bind address", "suggested": "0.0.0.0"},
     {"label": "--port", "key": "port", "type": "int", "default": "8080",
      "desc": "HTTP API port", "suggested": ""},
     {"label": "--temp", "key": "temp", "type": "float", "default": "0.8",
@@ -91,6 +91,12 @@ LLAMACPP_OPTS = [
      "desc": "Disable the built-in web UI", "suggested": "on"},
     {"label": "--no-cache-prompt", "key": "no_cache_prompt", "type": "flag", "default": "off",
      "desc": "Disable prompt caching", "suggested": "off"},
+    {"label": "--cache-disk", "key": "cache_disk", "type": "str", "default": "",
+     "desc": "Directory for persistent prompt/KV disk cache (empty = disabled; dir is auto-created)", "suggested": "/var/cache/llama-server/prompt-cache"},
+    {"label": "--cache-disk-max", "key": "cache_disk_max", "type": "int", "default": "32768",
+     "desc": "Maximum persistent cache size in MiB (0 = unlimited)", "suggested": "20480"},
+    {"label": "--cache-disk-block", "key": "cache_disk_block", "type": "int", "default": "256",
+     "desc": "Token block size for persistent cache lookup", "suggested": "256"},
     {"label": "--no-jinja", "key": "no_jinja", "type": "flag", "default": "off",
      "desc": "Disable jinja chat template engine", "suggested": "off"},
     {"label": "--metrics", "key": "metrics", "type": "flag", "default": "on",
@@ -102,8 +108,8 @@ DWARFSTAR_OPTS = [
      "desc": "GGUF model path to load", "suggested": ""},
     {"label": "--backend", "key": "backend", "type": "choice", "default": "rocm",
      "choices": ["metal", "rocm", "cpu"], "desc": "Compute backend", "suggested": "rocm"},
-    {"label": "-c, --ctx", "key": "ctx", "type": "int", "default": "65536",
-     "desc": "Allocated context tokens", "suggested": "65536"},
+    {"label": "-c, --ctx", "key": "ctx", "type": "int", "default": "131072",
+     "desc": "Allocated context tokens", "suggested": "131072"},
     {"label": "-n, --tokens", "key": "tokens", "type": "int", "default": "",
      "desc": "Default max output tokens when clients omit a limit (blank = server default, capped by ctx)", "suggested": ""},
     {"label": "-t, --threads", "key": "threads", "type": "int", "default": str(min(32, os.cpu_count() or 4)),
@@ -112,8 +118,8 @@ DWARFSTAR_OPTS = [
      "desc": "GPU duty-cycle target 1..100", "suggested": "100"},
     {"label": "--ssd-streaming", "key": "ssd_streaming", "type": "flag", "default": "off",
      "desc": "SSD-backed model streaming (avoid full RAM residency)", "suggested": "off"},
-    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
-     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--host", "key": "host", "type": "str", "default": "0.0.0.0",
+     "desc": "Bind address", "suggested": "0.0.0.0"},
     {"label": "--port", "key": "port", "type": "int", "default": "8000",
      "desc": "HTTP API port", "suggested": ""},
     {"label": "--cors", "key": "cors", "type": "flag", "default": "off",
@@ -163,6 +169,12 @@ STRIX_OPTS = [
      "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for K", "suggested": "q8_0"},
     {"label": "-ctv, --cache-type-v", "key": "cache_type_v", "type": "choice", "default": "q8_0",
      "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for V", "suggested": "q8_0"},
+    {"label": "--cache-disk", "key": "cache_disk", "type": "str", "default": "",
+     "desc": "Directory for persistent prompt/KV disk cache (empty = disabled; dir is auto-created)", "suggested": "/var/cache/llama-server/prompt-cache"},
+    {"label": "--cache-disk-max", "key": "cache_disk_max", "type": "int", "default": "32768",
+     "desc": "Maximum persistent cache size in MiB (0 = unlimited)", "suggested": "20480"},
+    {"label": "--cache-disk-block", "key": "cache_disk_block", "type": "int", "default": "256",
+     "desc": "Token block size for persistent cache lookup", "suggested": "256"},
     {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
      "desc": "Prompt context size (tokens)", "suggested": "131072"},
     {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
@@ -444,6 +456,16 @@ class ProcessManager:
                     except (ValueError, IndexError):
                         pass
                     port_note = f"[airunner] port {req} in use; using {free} instead"
+        # --- persistent disk prompt cache: expand ~ and create the dir (the server requires it to exist) ---
+        cache_dir = setup.get("options", {}).get("cache_disk", "")
+        if cache_dir:
+            cache_dir = os.path.expanduser(cache_dir)
+            os.makedirs(cache_dir, exist_ok=True)
+            try:
+                i = args.index("--cache-disk")
+                args[i + 1] = cache_dir
+            except (ValueError, IndexError):
+                pass
         # ensure port option applied for bookkeeping
         port = ""
         for o in RUNNER_OPTS[runner]:
