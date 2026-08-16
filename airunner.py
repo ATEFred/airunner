@@ -9,6 +9,7 @@ setups, autostart at boot (systemd user unit), and stream output to a web UI.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -57,6 +58,8 @@ RUNNER_LABEL = {
 LLAMACPP_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "--mmproj", "key": "mmproj", "type": "str", "default": "",
+     "desc": "Multimodal projector GGUF path for vision support", "suggested": ""},
     {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
      "desc": "Prompt context size (tokens)", "suggested": "131072"},
     {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
@@ -75,6 +78,12 @@ LLAMACPP_OPTS = [
      "desc": "Top-p sampling", "suggested": "0.95"},
     {"label": "--min-p", "key": "min_p", "type": "float", "default": "0.05",
      "desc": "Min-p sampling", "suggested": "0.05"},
+    {"label": "--reasoning-format", "key": "reasoning_format", "type": "choice", "default": "auto",
+     "choices": ["auto", "none", "deepseek", "gemma", "openai"], "desc": "Reasoning content format", "suggested": "auto"},
+    {"label": "--reasoning-effort", "key": "reasoning_effort", "type": "choice", "default": "medium",
+     "choices": ["low", "medium", "high"], "desc": "Reasoning effort level", "suggested": "medium"},
+    {"label": "--reasoning-budget", "key": "reasoning_budget", "type": "int", "default": "",
+     "desc": "Max reasoning tokens (blank = unlimited)", "suggested": "4096"},
     {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
      "desc": "RNG seed (-1 = random)", "suggested": "-1"},
     {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "auto",
@@ -152,11 +161,15 @@ DWARFSTAR_OPTS = [
      "desc": "Prefer exact kernels where faster approximate paths exist", "suggested": "off"},
     {"label": "--think", "key": "think", "type": "flag", "default": "off",
      "desc": "Enable normal thinking mode", "suggested": "off"},
+    {"label": "--think-budget", "key": "think_budget", "type": "int", "default": "",
+     "desc": "Max thinking tokens (blank = server default)", "suggested": "4096"},
 ]
 
 STRIX_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "--mmproj", "key": "mmproj", "type": "str", "default": "",
+     "desc": "Multimodal projector GGUF path for vision support", "suggested": ""},
     {"label": "-md, --model-draft", "key": "model_draft", "type": "str", "default": "",
      "desc": "Draft model for speculative decoding (e.g. DSpark drafter)", "suggested": ""},
     {"label": "-ngl, --n-gpu-layers", "key": "gpu_layers", "type": "str", "default": "all",
@@ -197,6 +210,12 @@ STRIX_OPTS = [
      "desc": "Top-p sampling", "suggested": "0.95"},
     {"label": "--min-p", "key": "min_p", "type": "float", "default": "0.05",
      "desc": "Min-p sampling", "suggested": "0.05"},
+    {"label": "--reasoning-format", "key": "reasoning_format", "type": "choice", "default": "auto",
+     "choices": ["auto", "none", "deepseek", "gemma", "openai"], "desc": "Reasoning content format", "suggested": "auto"},
+    {"label": "--reasoning-effort", "key": "reasoning_effort", "type": "choice", "default": "medium",
+     "choices": ["low", "medium", "high"], "desc": "Reasoning effort level", "suggested": "medium"},
+    {"label": "--reasoning-budget", "key": "reasoning_budget", "type": "int", "default": "",
+     "desc": "Max reasoning tokens (blank = unlimited)", "suggested": "4096"},
     {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
      "desc": "RNG seed (-1 = random)", "suggested": "-1"},
     {"label": "--jinja", "key": "jinja", "type": "flag", "default": "on",
@@ -648,8 +667,14 @@ def discover_models(dirs):
         if not os.path.isdir(d):
             continue
         for name in sorted(os.listdir(d)):
-            if name.lower().endswith(".gguf"):
-                found.append(os.path.join(d, name))
+            if not name.lower().endswith(".gguf"):
+                continue
+            m = re.search(r"-(\d+)-of-(\d+)\.gguf$", name)
+            if m:
+                this, total = int(m.group(1)), int(m.group(2))
+                if total > 1 and this > 1:
+                    continue
+            found.append(os.path.join(d, name))
     return found
 
 

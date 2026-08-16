@@ -42,10 +42,6 @@
   .badge.restart{background:var(--amber);color:#000}
   .badge.stop{background:var(--panel2);color:var(--muted)}
   .model-list{display:flex;flex-wrap:wrap;gap:6px}
-  .model-chip{background:var(--panel2);border:1px solid var(--border);border-radius:6px;
-       padding:4px 8px;font-size:12px;cursor:pointer}
-  .model-chip:hover{border-color:var(--accent)}
-  .model-chip.selected{border-color:var(--accent);color:var(--accent)}
   .console{background:#0b0d11;border:1px solid var(--border);border-radius:6px;
        height:300px;overflow:auto;font-family:monospace;font-size:12px;padding:8px;white-space:pre-wrap;word-break:break-word}
   .console .line{color:#c8d0e0}
@@ -107,7 +103,7 @@
         <option value="dwarfstar">DwarfStar (ds4-server)</option>
       </select>
       <label>Model</label>
-      <div class="model-list" id="model-list"></div>
+      <select id="model-list"></select>
       <label>Launch options</label>
       <div class="opt-grid" id="opt-grid"></div>
       <div class="row" style="margin-top:8px">
@@ -161,13 +157,14 @@ function renderModels(){
   if(selectedModel && !models.includes(selectedModel)) selectedModel = "";
   if(!selectedModel && models.length) selectedModel = models[0];
   models.forEach(m => {
-    const chip = document.createElement("div");
-    chip.className = "model-chip" + (m===selectedModel?" selected":"");
-    chip.textContent = m.split("/").pop();
-    chip.title = m;
-    chip.onclick = () => { selectedModel = m; optVals = {}; renderModels(); renderOptions(); };
-    list.appendChild(chip);
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m.split("/").pop();
+    opt.title = m;
+    if(m === selectedModel) opt.selected = true;
+    list.appendChild(opt);
   });
+  list.onchange = () => { selectedModel = list.value; optVals = {}; renderModels(); renderOptions(); };
 }
 
 function renderOptions(){
