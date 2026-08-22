@@ -271,6 +271,8 @@ ROCMFPX_PRESETS = {
 ROCMFPX_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "--mmproj", "key": "mmproj", "type": "str", "default": "",
+      "desc": "Multimodal projector GGUF path for vision support", "suggested": ""},
     {"label": "-dio, --direct-io", "key": "direct_io", "type": "flag", "default": "off",
      "desc": "Use DirectIO if available (this build predates --load-mode, so the legacy flag is used)", "suggested": "off"},
     {"label": "-dev, --device", "key": "device", "type": "str", "default": "Vulkan0",
@@ -378,11 +380,14 @@ MODEL_FAMILY_DEFAULTS = {
         # reasoning_effort: medium by default — the model's own default is xhigh
         # (very deep reasoning); pick low/medium/xhigh in the UI to taste.
         "llamacpp": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
-                     "chat_template": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
+                     "chat_template": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                     "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-27B-BF16.gguf"},
         "strix": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
-                  "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
+                  "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                  "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-27B-BF16.gguf"},
         "rocmfpx": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
-                    "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
+                    "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                    "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-27B-BF16.gguf"},
     },
     "deepseek": {
         "llamacpp": {"temp": "0.6", "top_p": "0.95", "min_p": "0"},
