@@ -32,11 +32,16 @@ SYSTEMD_UNIT = "airunner.service"
 SYSTEMD_DIR = os.path.expanduser("~/.config/systemd/user")
 
 DWARFSTAR_GGUF_DIR = "/home/fred/dwarfstar/gguf"
+# Official Qwen3.8 chat template (carries the reasoning_effort / preserve_thinking
+# logic the model's GGUFs lack). Needed for the reasoning_effort option to work.
+QWEN38_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "templates", "qwen3.8-chat-template.jinja")
 
 DEFAULT_CONFIG = {
     "llamacpp_bin": "/home/fred/ai/llama.cpp/build/bin/llama-server",
     "dwarfstar_bin": "/home/fred/dwarfstar/ds4-server",
     "strix_bin": "/home/fred/ai/strix-halo-llamacpp/build-vk/bin/llama-server",
+    "rocmfpx_bin": "/home/fred/ai/rocmfpx-llamacpp/build-strix-rocmfp4/bin/llama-server",
     "model_dirs": ["/home/fred/ai/models", DWARFSTAR_GGUF_DIR],
     "host": "127.0.0.1",
     "port": 8090,
@@ -47,6 +52,7 @@ RUNNER_LABEL = {
     "llamacpp": "llama.cpp (llama-server)",
     "dwarfstar": "DwarfStar (ds4-server)",
     "strix": "StrixHalo llama.cpp (Vulkan)",
+    "rocmfpx": "ROCmFPX llama.cpp (Vulkan/ROCm)",
 }
 
 # ---------------------------------------------------------------------------
@@ -58,6 +64,9 @@ RUNNER_LABEL = {
 LLAMACPP_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "-lm, --load-mode", "key": "load_mode", "type": "choice", "default": "mmap",
+     "choices": ["mmap", "none", "mlock", "mmap+mlock", "dio"],
+     "desc": "Model loading mode (dio = DirectIO disk reads; replaces the deprecated -dio/--direct-io flag)", "suggested": "dio"},
     {"label": "--mmproj", "key": "mmproj", "type": "str", "default": "",
      "desc": "Multimodal projector GGUF path for vision support", "suggested": ""},
     {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
@@ -86,6 +95,9 @@ LLAMACPP_OPTS = [
      "desc": "Token budget for thinking (-1 = unrestricted, 0 = immediate end)", "suggested": "-1"},
     {"label": "--reasoning-preserve", "key": "reasoning_preserve", "type": "flag", "default": "off",
      "desc": "Preserve reasoning trace in full history", "suggested": "off"},
+    {"label": "--reasoning-effort", "key": "reasoning_effort", "type": "choice", "default": "auto",
+     "choices": ["auto", "xhigh", "medium", "low"], "no_cli": True,
+     "desc": "Qwen3.8 reasoning depth (auto = model default: xhigh); sent as a chat template kwarg, needs the qwen3.8 chat template", "suggested": "medium"},
     {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
      "desc": "RNG seed (-1 = random)", "suggested": "-1"},
     {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "auto",
@@ -170,6 +182,9 @@ DWARFSTAR_OPTS = [
 STRIX_OPTS = [
     {"label": "-m, --model", "key": "model", "type": "str", "default": "",
      "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "-lm, --load-mode", "key": "load_mode", "type": "choice", "default": "mmap",
+     "choices": ["mmap", "none", "mlock", "mmap+mlock", "dio"],
+     "desc": "Model loading mode (dio = DirectIO disk reads; replaces the deprecated -dio/--direct-io flag)", "suggested": "dio"},
     {"label": "--mmproj", "key": "mmproj", "type": "str", "default": "",
      "desc": "Multimodal projector GGUF path for vision support", "suggested": ""},
     {"label": "-md, --model-draft", "key": "model_draft", "type": "str", "default": "",
@@ -220,6 +235,11 @@ STRIX_OPTS = [
      "desc": "Token budget for thinking (-1 = unrestricted, 0 = immediate end)", "suggested": "-1"},
     {"label": "--reasoning-preserve", "key": "reasoning_preserve", "type": "flag", "default": "off",
      "desc": "Preserve reasoning trace in full history", "suggested": "off"},
+    {"label": "--reasoning-effort", "key": "reasoning_effort", "type": "choice", "default": "auto",
+     "choices": ["auto", "xhigh", "medium", "low"], "no_cli": True,
+     "desc": "Qwen3.8 reasoning depth (auto = model default: xhigh); sent as a chat template kwarg, needs the qwen3.8 chat template", "suggested": "medium"},
+    {"label": "--chat-template-file", "key": "chat_template_file", "type": "str", "default": "",
+     "desc": "Chat template .jinja file (Qwen3.8 needs the official one for reasoning_effort)", "suggested": ""},
     {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
      "desc": "RNG seed (-1 = random)", "suggested": "-1"},
     {"label": "--jinja", "key": "jinja", "type": "flag", "default": "on",
@@ -234,7 +254,99 @@ STRIX_OPTS = [
      "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
 ]
 
-RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS}
+# MTP speed presets for the ROCmFPX runner (measured on Strix Halo / Qwen3.8-27B
+# ROCmFP4-FAST, Vulkan0, ctk q8_0 / ctv turbo4): code/JSON prompts see full-draft
+# acceptance at n7/p0.35 (~44 t/s), while free prose is best at n4 (~23-33 t/s).
+ROCMFPX_PRESETS = {
+    "default": {
+        "label": "Mixed chat (n4 / p0.55 / ub 512)",
+        "overrides": {"spec_draft_n_max": "4", "spec_draft_p_min": "0.55", "batch_size": "512", "ubatch_size": "512"},
+    },
+    "code": {
+        "label": "Code / JSON deep-spec (n7 / p0.35 / ub 2048)",
+        "overrides": {"spec_draft_n_max": "7", "spec_draft_p_min": "0.35", "batch_size": "2048", "ubatch_size": "2048"},
+    },
+}
+
+ROCMFPX_OPTS = [
+    {"label": "-m, --model", "key": "model", "type": "str", "default": "",
+     "desc": "GGUF model path to load", "suggested": ""},
+    {"label": "-dio, --direct-io", "key": "direct_io", "type": "flag", "default": "off",
+     "desc": "Use DirectIO if available (this build predates --load-mode, so the legacy flag is used)", "suggested": "off"},
+    {"label": "-dev, --device", "key": "device", "type": "str", "default": "Vulkan0",
+     "desc": "Backend device to offload to (Vulkan0 for decode speed, ROCm0 for prefill/TTFT)", "suggested": "Vulkan0"},
+    {"label": "-ngl, --n-gpu-layers", "key": "gpu_layers", "type": "str", "default": "999",
+     "desc": "Layers to keep on device (999 = all)", "suggested": "999"},
+    {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "on",
+     "choices": ["on", "off", "auto"], "desc": "Use Flash Attention", "suggested": "on"},
+    {"label": "-ctk, --cache-type-k", "key": "cache_type_k", "type": "str", "default": "q8_0",
+     "desc": "KV cache data type for K (q8_0 keeps attention quality; turbo4 compresses)", "suggested": "q8_0"},
+    {"label": "-ctv, --cache-type-v", "key": "cache_type_v", "type": "str", "default": "q8_0",
+     "desc": "KV cache data type for V (turbo4 for max compression)", "suggested": "q8_0"},
+    {"label": "--mtp-preset", "key": "mtp_preset", "type": "preset", "no_cli": True,
+     "choices": list(ROCMFPX_PRESETS.keys()), "default": "default",
+     "desc": "MTP speed preset (sets draft depth/temperature + batch sizes)", "suggested": "default"},
+    {"label": "--spec-type", "key": "spec_type", "type": "choice", "default": "draft-mtp",
+     "choices": ["none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark"],
+     "desc": "Speculative decoding type (draft-mtp for embedded MTP heads)", "suggested": "draft-mtp"},
+    {"label": "--spec-draft-n-max", "key": "spec_draft_n_max", "type": "int", "default": "4",
+     "desc": "Max draft tokens per speculative pass", "suggested": "4"},
+    {"label": "--spec-draft-n-min", "key": "spec_draft_n_min", "type": "int", "default": "0",
+     "desc": "Minimum draft tokens to use", "suggested": "0"},
+    {"label": "--spec-draft-p-min", "key": "spec_draft_p_min", "type": "float", "default": "0.55",
+     "desc": "Minimum speculative decoding probability (greedy)", "suggested": "0.55"},
+    {"label": "--spec-draft-p-split", "key": "spec_draft_p_split", "type": "float", "default": "0.10",
+     "desc": "Draft probability split", "suggested": "0.10"},
+    {"label": "--spec-draft-type-k", "key": "spec_draft_type_k", "type": "str", "default": "q4_0",
+     "desc": "KV cache type for draft model K", "suggested": "q4_0"},
+    {"label": "--spec-draft-type-v", "key": "spec_draft_type_v", "type": "str", "default": "q4_0",
+     "desc": "KV cache type for draft model V", "suggested": "q4_0"},
+    {"label": "-c, --ctx-size", "key": "ctx_size", "type": "int", "default": "131072",
+     "desc": "Prompt context size (tokens)", "suggested": "131072"},
+    {"label": "-b, --batch-size", "key": "batch_size", "type": "int", "default": "512",
+     "desc": "Logical batch size (prompt processing)", "suggested": "512"},
+    {"label": "-ub, --ubatch-size", "key": "ubatch_size", "type": "int", "default": "512",
+     "desc": "Micro batch size (physical batch)", "suggested": "512"},
+    {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
+     "desc": "Number of parallel slots", "suggested": "1"},
+    {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
+     "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
+    {"label": "-rea, --reasoning", "key": "reasoning", "type": "choice", "default": "auto",
+     "choices": ["on", "off", "auto"], "desc": "Use reasoning/thinking in the chat", "suggested": "auto"},
+    {"label": "--reasoning-format", "key": "reasoning_format", "type": "choice", "default": "auto",
+     "choices": ["auto", "none", "deepseek", "deepseek-legacy"], "desc": "Reasoning content format", "suggested": "auto"},
+    {"label": "--reasoning-budget", "key": "reasoning_budget", "type": "int", "default": "-1",
+     "desc": "Token budget for thinking (-1 = unrestricted)", "suggested": "-1"},
+    {"label": "--reasoning-preserve", "key": "reasoning_preserve", "type": "flag", "default": "off",
+     "desc": "Preserve reasoning trace in full history", "suggested": "off"},
+    {"label": "--reasoning-effort", "key": "reasoning_effort", "type": "choice", "default": "auto",
+     "choices": ["auto", "xhigh", "medium", "low"], "no_cli": True,
+     "desc": "Qwen3.8 reasoning depth (auto = model default: xhigh); sent as a chat template kwarg, needs the qwen3.8 chat template", "suggested": "medium"},
+    {"label": "--chat-template-file", "key": "chat_template_file", "type": "str", "default": "",
+     "desc": "Chat template .jinja file (Qwen3.8 needs the official one for reasoning_effort)", "suggested": ""},
+    {"label": "--jinja", "key": "jinja", "type": "flag", "default": "on",
+     "desc": "Enable jinja chat template engine", "suggested": "on"},
+    {"label": "--temp", "key": "temp", "type": "float", "default": "0.8",
+     "desc": "Sampling temperature (0 = greedy)", "suggested": "0"},
+    {"label": "--top-k", "key": "top_k", "type": "int", "default": "40",
+     "desc": "Top-k sampling (0 = disabled)", "suggested": "40"},
+    {"label": "--top-p", "key": "top_p", "type": "float", "default": "0.95",
+     "desc": "Top-p sampling", "suggested": "0.95"},
+    {"label": "--min-p", "key": "min_p", "type": "float", "default": "0.05",
+     "desc": "Min-p sampling", "suggested": "0.05"},
+    {"label": "-s, --seed", "key": "seed", "type": "int", "default": "-1",
+     "desc": "RNG seed (-1 = random)", "suggested": "-1"},
+    {"label": "--host", "key": "host", "type": "str", "default": "127.0.0.1",
+     "desc": "Bind address", "suggested": "127.0.0.1"},
+    {"label": "--port", "key": "port", "type": "int", "default": "8080",
+     "desc": "HTTP API port", "suggested": ""},
+    {"label": "--no-webui", "key": "no_webui", "type": "flag", "default": "off",
+     "desc": "Disable the built-in web UI", "suggested": "on"},
+    {"label": "--metrics", "key": "metrics", "type": "flag", "default": "on",
+     "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
+]
+
+RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS, "rocmfpx": ROCMFPX_OPTS}
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +371,18 @@ MODEL_FAMILY_DEFAULTS = {
         "llamacpp": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
         "strix": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
         "dwarfstar": {"ctx": "40960"},
+    },
+    "qwen3.8": {
+        # Official Qwen3.8 sampling (thinking mode) + the official chat template
+        # (the GGUFs carry no template) so reasoning_effort can take effect.
+        # reasoning_effort: medium by default — the model's own default is xhigh
+        # (very deep reasoning); pick low/medium/xhigh in the UI to taste.
+        "llamacpp": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
+                     "chat_template": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
+        "strix": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
+                  "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
+        "rocmfpx": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "131072",
+                    "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium"},
     },
     "deepseek": {
         "llamacpp": {"temp": "0.6", "top_p": "0.95", "min_p": "0"},
@@ -308,9 +432,9 @@ def model_defaults_for(models):
 def model_runner_of(model_path):
     if os.path.dirname(os.path.abspath(model_path)) == os.path.abspath(DWARFSTAR_GGUF_DIR):
         return ["dwarfstar"]
-    # everything else is a llama.cpp-family model: usable by both mainline and the
-    # StrixHalo Vulkan fork
-    return ["llamacpp", "strix"]
+    # everything else is a llama.cpp-family model: usable by mainline, the
+    # StrixHalo Vulkan fork, and the ROCmFPX fork
+    return ["llamacpp", "strix", "rocmfpx"]
 
 
 def option_cli_args(runner, opts):
@@ -319,6 +443,8 @@ def option_cli_args(runner, opts):
     for o in RUNNER_OPTS[runner]:
         key = o["key"]
         if key not in opts:
+            continue
+        if o.get("no_cli"):
             continue
         v = opts[key]
         if v is None or v == "":
@@ -439,7 +565,7 @@ class ProcessManager:
         self.watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
 
     def _bin_for(self, runner):
-        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"]}[runner]
+        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"]}[runner]
 
     def _reader(self, pid, proc):
         try:
@@ -463,6 +589,11 @@ class ProcessManager:
             args.append("-m")
             args.append(model)
         args += option_cli_args(runner, setup.get("options", {}))
+        # llama.cpp has no --reasoning-effort flag; Qwen3.8-style jinja templates
+        # take it as a template kwarg, so translate it to --chat-template-kwargs.
+        eff = setup.get("options", {}).get("reasoning_effort", "")
+        if eff in ("xhigh", "medium", "low"):
+            args += ["--chat-template-kwargs", json.dumps({"reasoning_effort": eff})]
         # --- port conflict handling: if requested port is taken, auto-pick a free one ---
         pk = port_opt_key(runner)
         port_note = ""
@@ -502,6 +633,11 @@ class ProcessManager:
             self.procs[proc.id] = proc
         env = dict(os.environ)
         env["LLAMA_ARG_CTX_SIZE"] = str(setup.get("options", {}).get("ctx_size", ""))
+        if runner == "rocmfpx":
+            # ROCmFPX fork: needed for the ROCm/HIP backend on gfx1151 (Strix Halo).
+            # Harmless for the Vulkan path but required if the user selects ROCm0.
+            env.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.5.1")
+            env.setdefault("GGML_HIP_ENABLE_UNIFIED_MEMORY", "1")
         try:
             p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, env=env)
@@ -832,6 +968,7 @@ class API:
             "models": models,
             "runners": RUNNER_LABEL,
             "options": RUNNER_OPTS,
+            "rocmfpx_presets": ROCMFPX_PRESETS,
             "model_defaults": model_defaults_for(models),
             "model_runners": {m: model_runner_of(m) for m in models},
         }
@@ -934,6 +1071,7 @@ def main():
     ap.add_argument("--llamacpp-bin", help="llama-server binary")
     ap.add_argument("--dwarfstar-bin", help="ds4-server binary")
     ap.add_argument("--strix-bin", help="StrixHalo llama.cpp (Vulkan) llama-server binary")
+    ap.add_argument("--rocmfpx-bin", help="ROCmFPX llama.cpp (Vulkan/ROCm) llama-server binary")
     args = ap.parse_args()
     if args.host:
         cfg["host"] = args.host
@@ -945,6 +1083,8 @@ def main():
         cfg["dwarfstar_bin"] = args.dwarfstar_bin
     if args.strix_bin:
         cfg["strix_bin"] = args.strix_bin
+    if args.rocmfpx_bin:
+        cfg["rocmfpx_bin"] = args.rocmfpx_bin
 
     api = API(cfg)
     server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)

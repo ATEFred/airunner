@@ -79,6 +79,8 @@
       <input id="cfg-dwarfstar" placeholder="/path/to/ds4-server">
       <label>StrixHalo llama.cpp binary (llama-server, Vulkan)</label>
       <input id="cfg-strix" placeholder="/path/to/strix-halo llama-server">
+      <label>ROCmFPX llama.cpp binary (llama-server, Vulkan/ROCm)</label>
+      <input id="cfg-rocmfpx" placeholder="/path/to/rocmfpx llama-server">
       <label>Model directories (comma-separated)</label>
       <input id="cfg-models" placeholder="/path/to/models">
       <div class="row">
@@ -100,6 +102,7 @@
       <select id="runner">
         <option value="llamacpp">llama.cpp (llama-server)</option>
         <option value="strix">StrixHalo llama.cpp (Vulkan)</option>
+        <option value="rocmfpx">ROCmFPX llama.cpp (Vulkan/ROCm)</option>
         <option value="dwarfstar">DwarfStar (ds4-server)</option>
       </select>
       <label>Model</label>
@@ -219,6 +222,23 @@ function renderOptions(){
         s.appendChild(op);
       });
       s.onchange = () => { optVals[runner] = optVals[runner]||{}; optVals[runner][o.key] = s.value; };
+      item.appendChild(s);
+    } else if(o.type === "preset"){
+      const presets = state.rocmfpx_presets || {};
+      const s = document.createElement("select");
+      Object.entries(presets).forEach(([name, p]) => {
+        const op = document.createElement("option");
+        op.value = name; op.textContent = (p && p.label) || name;
+        s.appendChild(op);
+      });
+      s.value = (val != null && presets[val] != null) ? val : (Object.keys(presets)[0] || "default");
+      s.onchange = () => {
+        optVals[runner] = optVals[runner] || {};
+        optVals[runner][o.key] = s.value;
+        const ov = ((presets[s.value] || {}).overrides) || {};
+        Object.entries(ov).forEach(([k, v]) => { optVals[runner][k] = v; });
+        renderOptions();
+      };
       item.appendChild(s);
     } else {
       const input = document.createElement("input");
@@ -382,6 +402,7 @@ async function refresh(){
   $("cfg-llamacpp").value = state.config.llamacpp_bin || "";
   $("cfg-dwarfstar").value = state.config.dwarfstar_bin || "";
   $("cfg-strix").value = state.config.strix_bin || "";
+  $("cfg-rocmfpx").value = state.config.rocmfpx_bin || "";
   $("cfg-models").value = (state.config.model_dirs||[]).join(", ");
   $("cfg-host").value = state.config.host || "";
   $("cfg-port").value = state.config.port || "";
@@ -418,6 +439,7 @@ document.addEventListener("DOMContentLoaded", () => {
       llamacpp_bin: $("cfg-llamacpp").value.trim(),
       dwarfstar_bin: $("cfg-dwarfstar").value.trim(),
       strix_bin: $("cfg-strix").value.trim(),
+      rocmfpx_bin: $("cfg-rocmfpx").value.trim(),
       model_dirs: $("cfg-models").value.split(",").map(s=>s.trim()).filter(Boolean),
       host: $("cfg-host").value.trim(), port: parseInt($("cfg-port").value)||8090,
       watchdog_interval: parseInt($("cfg-wd").value)||5,
