@@ -209,6 +209,8 @@ STRIX_OPTS = [
      "desc": "Prompt context size (tokens)", "suggested": "131072"},
     {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
      "desc": "Number of parallel slots", "suggested": "1"},
+    {"label": "-a, --alias", "key": "alias", "type": "str", "default": "",
+     "desc": "Model alias used by the API (comma-separated); the name Open WebUI etc. see", "suggested": ""},
     {"label": "-b, --batch-size", "key": "batch_size", "type": "int", "default": "2048",
      "desc": "Logical batch size (prompt processing)", "suggested": "2048"},
     {"label": "-ub, --ubatch-size", "key": "ubatch_size", "type": "int", "default": "2048",
@@ -311,6 +313,8 @@ ROCMFPX_OPTS = [
      "desc": "Micro batch size (physical batch)", "suggested": "512"},
     {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
      "desc": "Number of parallel slots", "suggested": "1"},
+    {"label": "-a, --alias", "key": "alias", "type": "str", "default": "",
+     "desc": "Model alias used by the API (comma-separated); the name Open WebUI etc. see", "suggested": ""},
     {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
      "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
     {"label": "-rea, --reasoning", "key": "reasoning", "type": "choice", "default": "auto",
@@ -982,8 +986,14 @@ class API:
         setups = self.store.get("setups", [])
         sid = body.get("id")
         if sid:
-            setups = [s for s in setups if s.get("id") != sid]
-        else:
+            # update an existing setup in place (preserve list position + created time)
+            for i, s in enumerate(setups):
+                if s.get("id") == sid:
+                    body.setdefault("created", s.get("created", time.time()))
+                    setups[i] = body
+                    self.store.set("setups", setups)
+                    return {"ok": True, "setup": body}
+        if not body.get("id"):
             body["id"] = uuid.uuid4().hex[:12]
         body.setdefault("created", time.time())
         setups.append(body)

@@ -114,6 +114,7 @@
       </div>
       <div class="chk"><input type="checkbox" id="autostart"><label>Autostart at machine boot</label></div>
       <div class="chk"><input type="checkbox" id="restart"><label>Restart if it crashes</label></div>
+      <div class="meta" id="edit-banner" style="margin-top:8px"></div>
       <div class="row" style="margin-top:10px">
         <button class="btn primary" id="btn-run">Run now</button>
         <button class="btn" id="btn-save">Save setup</button>
@@ -140,6 +141,8 @@ const $ = id => document.getElementById(id);
 let state = null;
 let selectedModel = "";
 let optVals = {};
+let editingId = null;
+let editingSetup = null;
 
 async function j(url, method="GET", body=null){
   const r = await fetch(url, {method, headers:{"Content-Type":"application/json"},
@@ -353,13 +356,16 @@ function renderSetups(){
     const apply = document.createElement("button");
     apply.className = "btn primary"; apply.textContent = "Run";
     apply.onclick = () => j("/api/apply-setup", "POST", {id: s.id}).then(refresh);
+    const edit = document.createElement("button");
+    edit.className = "btn"; edit.textContent = "Edit";
+    edit.onclick = () => { editSetup(s); $("left").scrollIntoView({behavior:"smooth"}); };
     const clone = document.createElement("button");
     clone.className = "btn"; clone.textContent = "Clone";
     clone.onclick = () => cloneSetup(s);
     const del = document.createElement("button");
     del.className = "btn danger"; del.textContent = "Delete";
     del.onclick = () => j("/api/delete-setup", "POST", {id: s.id}).then(refresh);
-    actions.append(apply, clone, del);
+    actions.append(apply, edit, clone, del);
     const autochk = document.createElement("label");
     autochk.className = "chk";
     const chk = document.createElement("input");
@@ -376,7 +382,7 @@ function renderSetups(){
   }
 }
 
-function cloneSetup(s){
+function loadIntoForm(s){
   $("runner").value = s.runner;
   selectedModel = s.model;
   optVals = {};
@@ -386,13 +392,41 @@ function cloneSetup(s){
   $("restart").checked = !!s.restart_on_crash;
   renderModels();
   renderOptions();
+}
+
+function updateEditBanner(){
+  const b = $("edit-banner");
+  if(editingId && editingSetup){
+    b.innerHTML = `✎ Editing <b>${esc(editingSetup.name || editingSetup.model)}</b> — “Save setup” updates this config`;
+  } else {
+    b.innerHTML = "";
+  }
+  $("btn-save").textContent = editingId ? "Save changes" : "Save setup";
+}
+
+function cloneSetup(s){
+  loadIntoForm(s);
+  editingId = null; editingSetup = null;
+  updateEditBanner();
   $("launch-msg").innerHTML = `<div class="ok">cloned setup into form</div>`;
+}
+
+function editSetup(s){
+  loadIntoForm(s);
+  editingId = s.id;
+  editingSetup = {...s};
+  updateEditBanner();
+  $("launch-msg").innerHTML = `<div class="ok">editing <b>${esc(s.name||s.model)}</b></div>`;
 }
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({'&':'&','<':'<','>':'>'}[c])); }
 
 async function refresh(){
   state = await j("/api/state");
+  if(editingId && !(state.setups||[]).some(s => s.id === editingId)){
+    editingId = null; editingSetup = null;
+  }
+  updateEditBanner();
   renderModels();
   renderOptions();
   renderProcs();
@@ -427,12 +461,20 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   $("btn-save").onclick = async () => {
     const setup = buildSetup();
-    const nm = prompt("Name this setup", setup.model ? setup.model.split("/").pop() : "unnamed");
+    const isEdit = !!(editingId && editingSetup);
+    const defaultName = (isEdit && editingSetup.name) || (setup.model ? setup.model.split("/").pop() : "unnamed");
+    const nm = prompt(isEdit ? "Update this setup's name" : "Name this setup", defaultName);
     if(nm == null) return;
     setup.name = nm;
+    if(isEdit){ setup.id = editingId; setup.created = editingSetup.created; }
     const r = await j("/api/save-setup", "POST", setup);
     if(r.error){ $("launch-msg").innerHTML = `<div class="err">${esc(r.error)}</div>`; }
-    else { $("launch-msg").innerHTML = `<div class="ok">setup saved</div>`; refresh(); }
+    else {
+      $("launch-msg").innerHTML = `<div class="ok">${isEdit ? "setup updated" : "setup saved"}</div>`;
+      editingId = null; editingSetup = null;
+      updateEditBanner();
+      refresh();
+    }
   };
   $("btn-savecfg").onclick = async () => {
     const cfg = {
