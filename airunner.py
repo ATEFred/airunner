@@ -576,6 +576,24 @@ class ProcessManager:
     def _bin_for(self, runner):
         return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"]}[runner]
 
+    def _port_holder(self, port):
+        """What is holding a port right now, or None if free.
+        Only live processes count: another airunner model still up, or anything
+        else bound to the port. Stopped/removed airunner entries never count."""
+        with self.lock:
+            for p in self.procs.values():
+                if p.status in ("running", "restarting") and p.pid is not None \
+                        and (p.setup.get("port") or "") == str(port):
+                    return f"airunner model '{p.setup.get('name') or os.path.basename(p.setup.get('model', ''))}' (pid {p.pid})"
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+            return None
+        except OSError:
+            return "another process on this machine"
+        finally:
+            s.close()
+
     def _reader(self, pid, proc):
         try:
             for line in proc.stdout:
@@ -603,22 +621,26 @@ class ProcessManager:
         eff = setup.get("options", {}).get("reasoning_effort", "")
         if eff in ("xhigh", "medium", "low"):
             args += ["--chat-template-kwargs", json.dumps({"reasoning_effort": eff})]
-        # --- port conflict handling: if requested port is taken, auto-pick a free one ---
+        # --- port policy: use the configured port exactly; never reassign.
+        # Refuse to start if the port is taken (by another airunner model or any
+        # other live process). Stopped/removed airunner entries never count ---
+        # --- as holders, only processes that are actually up do. ---
         pk = port_opt_key(runner)
-        port_note = ""
-        if pk is not None:
-            req = setup.get("options", {}).get(pk, "")
-            if req:
-                free = find_free_port(int(req))
-                if free != int(req):
-                    setup.setdefault("options", {})[pk] = str(free)
-                    # rewrite the --port value already in args
-                    try:
-                        i = args.index("--port")
-                        args[i + 1] = str(free)
-                    except (ValueError, IndexError):
-                        pass
-                    port_note = f"[airunner] port {req} in use; using {free} instead"
+        req = setup.get("options", {}).get(pk, "") if pk is not None else ""
+        if req and req.isdigit():
+            holder = self._port_holder(int(req))
+            if holder:
+                proc = Process(None, setup)
+                proc.setup["port"] = req
+                proc.status = "stopped"
+                proc.log.append("$ " + " ".join(args))
+                proc.log.append(
+                    f"[airunner] REFUSED to start: port {req} is in use ({holder}). "
+                    f"Stop what is holding it, or change this setup's port."
+                )
+                with self.lock:
+                    self.procs[proc.id] = proc
+                return proc
         # --- persistent disk prompt cache: expand ~ and create the dir (the server requires it to exist) ---
         cache_dir = setup.get("options", {}).get("cache_disk", "")
         if cache_dir:
@@ -653,8 +675,6 @@ class ProcessManager:
             proc.pid = p.pid
             proc.stdout = p.stdout
             proc.log.append("$ " + " ".join(args))
-            if port_note:
-                proc.log.append(port_note)
             r = threading.Thread(target=self._reader, args=(p.pid, proc), daemon=True)
             proc.reader = r
             self.readers[p.pid] = r
@@ -678,6 +698,12 @@ class ProcessManager:
         # Send SIGINT (same as Ctrl+C, which DwarfStar handles instantly),
         # then escalate to SIGKILL if it does not exit.
         def _kill():
+            def _forget():
+                # drop the record once the process is really gone, so stopped
+                # entries never linger (and never look like port holders)
+                proc.status = "stopped"
+                with self.lock:
+                    self.procs.pop(proc.id, None)
             try:
                 os.kill(pidv, 2)  # SIGINT
             except Exception:
@@ -686,17 +712,17 @@ class ProcessManager:
                 try:
                     os.kill(pidv, 0)
                 except OSError:
-                    proc.status = "stopped"
+                    _forget()
                     return
                 except Exception:
-                    proc.status = "stopped"
+                    _forget()
                     return
                 time.sleep(0.1)
             try:
                 os.kill(pidv, 9)  # SIGKILL fallback
             except Exception:
                 pass
-            proc.status = "stopped"
+            _forget()
         threading.Thread(target=_kill, daemon=True).start()
         return True
 
@@ -706,6 +732,14 @@ class ProcessManager:
             self._watchdog_tick()
 
     def _watchdog_tick(self):
+        # reap stale refused-launch records (no pid, parked as "stopped") after 2 min
+        stale = []
+        with self.lock:
+            for qid, q in self.procs.items():
+                if q.pid is None and q.status == "stopped" and time.time() - q.start_time > 120:
+                    stale.append(qid)
+            for qid in stale:
+                self.procs.pop(qid, None)
         snapshot = []
         with self.lock:
             snapshot = [(pid, p) for pid, p in self.procs.items()]
@@ -729,12 +763,20 @@ class ProcessManager:
                 proc.status = "restarting"
                 proc.log.append(f"[airunner] process died (rc={rc}); restarting ({proc.restarts})")
                 new = self.start(proc.setup)
-                if new:
+                if new and new.pid is not None:
                     # carry restart count across the fresh Process record
                     new.restarts = proc.restarts
                     with self.lock:
                         self.procs.pop(pid, None)
                         self.procs[new.id] = new
+                else:
+                    # refused (e.g. port busy): keep the crashed record visible,
+                    # drop the parked refused record, and don't loop on it
+                    if new is not None:
+                        with self.lock:
+                            self.procs.pop(new.id, None)
+                    proc.status = "crashed"
+                    proc.log.append("[airunner] restart refused (port in use); left in crashed state")
                 continue
 
     @staticmethod
@@ -911,6 +953,8 @@ class Handler(BaseHTTPRequestHandler):
             if model and not os.path.exists(model):
                 return self._send(400, {"error": f"model not found: {model}"})
             proc = api.pm.start(setup)
+            if proc.pid is None:
+                return self._send(200, {"ok": False, "error": proc.log[-1] if proc.log else "failed to start"})
             return self._send(200, {"proc": proc.to_dict()})
         if route == "/api/stop":
             body = self._read_json()
@@ -1027,8 +1071,11 @@ class API:
         if not proc:
             return {"error": "not found"}
         new = self.pm.start(proc.setup)
-        if not new:
-            return {"error": "failed to start"}
+        if new.pid is None:
+            self.pm.procs.pop(new.id, None)
+            proc.status = "crashed"
+            proc.log.append("[airunner] restart refused (port in use); left in crashed state")
+            return {"error": proc.log[-1] if proc.log else "failed to start"}
         with self.pm.lock:
             self.pm.procs.pop(pid, None)
             self.pm.procs[new.id] = new
@@ -1041,6 +1088,8 @@ class API:
         if not setup:
             return {"error": "setup not found"}
         proc = self.pm.start(setup)
+        if proc.pid is None:
+            return {"ok": False, "error": proc.log[-1] if proc.log else "failed to start"}
         return {"ok": True, "proc": proc.to_dict()}
 
     def install_systemd(self):

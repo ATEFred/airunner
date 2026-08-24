@@ -355,7 +355,7 @@ function renderSetups(){
     actions.className = "actions";
     const apply = document.createElement("button");
     apply.className = "btn primary"; apply.textContent = "Run";
-    apply.onclick = () => j("/api/apply-setup", "POST", {id: s.id}).then(refresh);
+    apply.onclick = () => j("/api/apply-setup", "POST", {id: s.id}).then(r => { if (r && r.error) alert(r.error); refresh(); });
     const edit = document.createElement("button");
     edit.className = "btn"; edit.textContent = "Edit";
     edit.onclick = () => { editSetup(s); $("left").scrollIntoView({behavior:"smooth"}); };

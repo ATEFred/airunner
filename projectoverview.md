@@ -32,8 +32,9 @@ HTML file. There is no `pip`, so keep it stdlib-only.
   relaunched whenever its process dies; restart count shown per model.
 - **Config panel** to point at the llama.cpp / DwarfStar binaries and the model
   directories scanned for `.gguf` files.
-- **Port conflict handling**: if a requested port is taken, it auto-assigns the
-  next free port and logs `[airunner] port X in use; using Y instead`.
+- **Port policy**: the configured port is used exactly as set. If it is taken
+  (by another airunner model or any other live process), the launch is refused and
+  the reason is shown. Stopped/removed entries never reserve a port.
 - **MTP/DSpark support** for DwarfStar: `--mtp` renders as a dropdown of
   candidate support/draft GGUF files found in the model dirs.
 
