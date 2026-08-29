@@ -81,6 +81,10 @@
       <input id="cfg-strix" placeholder="/path/to/strix-halo llama-server">
       <label>ROCmFPX llama.cpp binary (llama-server, Vulkan/ROCm)</label>
       <input id="cfg-rocmfpx" placeholder="/path/to/rocmfpx llama-server">
+      <label>qwen4exp llama.cpp binary (llama-server, Vulkan, MTP)</label>
+      <input id="cfg-q4exp" placeholder="/path/to/qwen4exp llama-server">
+      <label>ROCmFP4 llama.cpp binary (llama-server, Vulkan)</label>
+      <input id="cfg-laurent" placeholder="/path/to/rocmfp4 llama-server">
       <label>Model directories (comma-separated)</label>
       <input id="cfg-models" placeholder="/path/to/models">
       <div class="row">
@@ -103,6 +107,8 @@
         <option value="llamacpp">llama.cpp (llama-server)</option>
         <option value="strix">StrixHalo llama.cpp (Vulkan)</option>
         <option value="rocmfpx">ROCmFPX llama.cpp (Vulkan/ROCm)</option>
+        <option value="q4exp">qwen4exp llama.cpp (Vulkan, MTP)</option>
+        <option value="laurent">ROCmFP4 llama.cpp (Vulkan, qwen4exp)</option>
         <option value="dwarfstar">DwarfStar (ds4-server)</option>
       </select>
       <label>Model</label>
@@ -437,6 +443,8 @@ async function refresh(){
   $("cfg-dwarfstar").value = state.config.dwarfstar_bin || "";
   $("cfg-strix").value = state.config.strix_bin || "";
   $("cfg-rocmfpx").value = state.config.rocmfpx_bin || "";
+  $("cfg-q4exp").value = state.config.q4exp_bin || "";
+  $("cfg-laurent").value = state.config.laurent_bin || "";
   $("cfg-models").value = (state.config.model_dirs||[]).join(", ");
   $("cfg-host").value = state.config.host || "";
   $("cfg-port").value = state.config.port || "";
@@ -482,6 +490,8 @@ document.addEventListener("DOMContentLoaded", () => {
       dwarfstar_bin: $("cfg-dwarfstar").value.trim(),
       strix_bin: $("cfg-strix").value.trim(),
       rocmfpx_bin: $("cfg-rocmfpx").value.trim(),
+      q4exp_bin: $("cfg-q4exp").value.trim(),
+      laurent_bin: $("cfg-laurent").value.trim(),
       model_dirs: $("cfg-models").value.split(",").map(s=>s.trim()).filter(Boolean),
       host: $("cfg-host").value.trim(), port: parseInt($("cfg-port").value)||8090,
       watchdog_interval: parseInt($("cfg-wd").value)||5,

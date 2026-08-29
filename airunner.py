@@ -42,6 +42,8 @@ DEFAULT_CONFIG = {
     "dwarfstar_bin": "/home/fred/dwarfstar/ds4-server",
     "strix_bin": "/home/fred/ai/strix-halo-llamacpp/build-vk/bin/llama-server",
     "rocmfpx_bin": "/home/fred/ai/rocmfpx-llamacpp/build-strix-rocmfp4/bin/llama-server",
+    "q4exp_bin": "/home/fred/ai/qwen4exp-llamacpp/build-vk/bin/llama-server",
+    "laurent_bin": "/home/fred/ai/rocmfp4-q4exp-llamacpp/build-vk/bin/llama-server",
     "model_dirs": ["/home/fred/ai/models", DWARFSTAR_GGUF_DIR],
     "host": "127.0.0.1",
     "port": 8090,
@@ -53,6 +55,8 @@ RUNNER_LABEL = {
     "dwarfstar": "DwarfStar (ds4-server)",
     "strix": "StrixHalo llama.cpp (Vulkan)",
     "rocmfpx": "ROCmFPX llama.cpp (Vulkan/ROCm)",
+    "q4exp": "qwen4exp llama.cpp (Vulkan, MTP sidecar)",
+    "laurent": "ROCmFP4 llama.cpp (Vulkan, qwen4exp)",
 }
 
 # ---------------------------------------------------------------------------
@@ -102,6 +106,20 @@ LLAMACPP_OPTS = [
      "desc": "RNG seed (-1 = random)", "suggested": "-1"},
     {"label": "-fa, --flash-attn", "key": "flash_attn", "type": "choice", "default": "auto",
      "choices": ["auto", "on", "off"], "desc": "Use Flash Attention", "suggested": "auto"},
+    {"label": "-md, --model-draft", "key": "model_draft", "type": "str", "default": "",
+     "desc": "Draft model for speculative decoding (e.g. MTP sidecar GGUF)", "suggested": ""},
+    {"label": "-ngld, --n-gpu-layers-draft", "key": "draft_gpu_layers", "type": "str", "default": "all",
+     "desc": "Layers of the draft model to keep in VRAM (number, 'auto' or 'all')", "suggested": "all"},
+    {"label": "--spec-type", "key": "spec_type", "type": "str", "default": "",
+     "desc": "Speculative decoding type (e.g. draft-mtp, draft-dspark; empty = off)", "suggested": ""},
+    {"label": "--spec-draft-n-max", "key": "spec_draft_n_max", "type": "int", "default": "0",
+     "desc": "Max draft tokens per speculative pass (0 = server default)", "suggested": "0"},
+    {"label": "--spec-draft-p-min", "key": "spec_draft_p_min", "type": "float", "default": "0.0",
+     "desc": "Minimum speculative decoding probability (greedy; higher = shorter drafts, more acceptance)", "suggested": "0.0"},
+    {"label": "-ctk, --cache-type-k", "key": "cache_type_k", "type": "choice", "default": "f16",
+     "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for K", "suggested": "q8_0"},
+    {"label": "-ctv, --cache-type-v", "key": "cache_type_v", "type": "choice", "default": "f16",
+     "choices": ["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"], "desc": "KV cache data type for V", "suggested": "q8_0"},
     {"label": "-np, --parallel", "key": "parallel", "type": "int", "default": "1",
      "desc": "Number of parallel slots", "suggested": "1"},
     {"label": "-a, --alias", "key": "alias", "type": "str", "default": "",
@@ -216,9 +234,13 @@ STRIX_OPTS = [
     {"label": "-ub, --ubatch-size", "key": "ubatch_size", "type": "int", "default": "2048",
      "desc": "Micro batch size (physical batch)", "suggested": "2048"},
     {"label": "--spec-type", "key": "spec_type", "type": "str", "default": "draft-dspark",
-     "desc": "Speculative decoding types (comma-separated, e.g. draft-dspark)", "suggested": "draft-dspark"},
+     "desc": "Speculative decoding types (comma-separated, e.g. draft-dspark, draft-mtp)", "suggested": "draft-dspark"},
     {"label": "--spec-draft-n-max", "key": "spec_draft_n_max", "type": "int", "default": "64",
      "desc": "Max draft tokens per speculative pass", "suggested": "64"},
+    {"label": "--spec-draft-n-min", "key": "spec_draft_n_min", "type": "int", "default": "0",
+     "desc": "Minimum draft tokens to use (0 = server decides)", "suggested": "0"},
+    {"label": "--spec-draft-p-min", "key": "spec_draft_p_min", "type": "float", "default": "0.0",
+     "desc": "Minimum speculative decoding probability (greedy; higher = shorter drafts, more acceptance)", "suggested": "0.0"},
     {"label": "-t, --threads", "key": "threads", "type": "int", "default": "-1",
      "desc": "CPU threads for generation (-1 = auto)", "suggested": str(min(32, os.cpu_count() or 4))},
     {"label": "--temp", "key": "temp", "type": "float", "default": "0.8",
@@ -255,6 +277,16 @@ STRIX_OPTS = [
     {"label": "--metrics", "key": "metrics", "type": "flag", "default": "on",
      "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
 ]
+
+# qwen4exp fork (apepojken qwen4exp-spec-mtp): same flag surface as the Strix fork
+# except the --cache-disk trio, which that build does not have.
+Q4EXP_OPTS = [o for o in STRIX_OPTS if o["key"] not in ("cache_disk", "cache_disk_max", "cache_disk_block")]
+
+# LaurentZuijdwijk fork (vulkan/qwen4exp-rocmfpx): only engine that loads the
+# ROCmFP4-FAST quant of Qwen3.8-Flash-Next. Same flag surface as the Strix fork
+# except the --cache-disk trio. No MTP sidecar exists for the ROCmFP4 quant, so
+# it runs target-only. PLE table is embedded in the file (or --model-ple).
+LAURENT_OPTS = [o for o in STRIX_OPTS if o["key"] not in ("cache_disk", "cache_disk_max", "cache_disk_block")]
 
 # MTP speed presets for the ROCmFPX runner (measured on Strix Halo / Qwen3.8-27B
 # ROCmFP4-FAST, Vulkan0, ctk q8_0 / ctv turbo4): code/JSON prompts see full-draft
@@ -352,7 +384,7 @@ ROCMFPX_OPTS = [
      "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
 ]
 
-RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS, "rocmfpx": ROCMFPX_OPTS}
+RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS, "rocmfpx": ROCMFPX_OPTS, "q4exp": Q4EXP_OPTS, "laurent": LAURENT_OPTS}
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +409,38 @@ MODEL_FAMILY_DEFAULTS = {
         "llamacpp": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
         "strix": {"temp": "0.6", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "40960"},
         "dwarfstar": {"ctx": "40960"},
+    },
+    "qwen3.8-flash": {
+        # Qwen3.8-Flash-Next (qwen4exp, 125B-A6B MoE): verified Strix Halo setup
+        # (community transcript): FA on, q8_0 KV, 256K ctx, ub 2048, MTP draft
+        # sidecar at n6 / p0.75. Must stay before the "qwen3.8" entry so the
+        # substring match picks it up.
+        "llamacpp": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "262144",
+                     "flash_attn": "on", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+                     "chat_template": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                     "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf"},
+        "strix": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "262144",
+                  "flash_attn": "on", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+                  "batch_size": "2048", "ubatch_size": "2048",
+                  "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                  "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf"},
+        # q4exp fork: the verified engine for this model (MTP sidecar works there).
+        "q4exp": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "262144",
+                  "flash_attn": "on", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+                  "batch_size": "2048", "ubatch_size": "2048",
+                  "spec_type": "draft-mtp", "spec_draft_n_max": "6", "spec_draft_p_min": "0.75",
+                  "model_draft": "/home/fred/ai/models/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+                  "draft_gpu_layers": "all",
+                  "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                  "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf"},
+        # ROCmFP4-FAST quant: target-only (no MTP sidecar for that quant).
+        # Benchmarked: prefill ~equal to UD-Q3_K_XL, raw decode 11.6-25.7 t/s
+        # (degrades with ctx; no MTP). Keep the flags identical to the verified set.
+        "laurent": {"temp": "1.0", "top_k": "20", "top_p": "0.95", "min_p": "0", "ctx_size": "262144",
+                    "flash_attn": "on", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+                    "batch_size": "2048", "ubatch_size": "2048",
+                    "chat_template_file": QWEN38_TEMPLATE, "reasoning_effort": "medium",
+                    "mmproj": "/home/fred/ai/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf"},
     },
     "qwen3.8": {
         # Official Qwen3.8 sampling (thinking mode) + the official chat template
@@ -441,6 +505,18 @@ def model_defaults_for(models):
 def model_runner_of(model_path):
     if os.path.dirname(os.path.abspath(model_path)) == os.path.abspath(DWARFSTAR_GGUF_DIR):
         return ["dwarfstar"]
+    # Qwen3.8-Flash-Next (qwen4exp): only the q4exp fork can load its MTP sidecar;
+    # the other engines either lack qwen4exp or expect a different draft format.
+    name = os.path.basename(model_path).lower()
+    if any(t in name for t in ("mtp", "draft", "dspark", "mmproj")):
+        return ["llamacpp", "strix", "rocmfpx", "q4exp"]
+    if "qwen3.8-flash" in name:
+        # ROCmFP4-FAST quant only loads on the LaurentZuijdwijk fork; the
+        # standard quants (UD-Q3_K_XL, AP-IQ4_XS, ...) run on the q4exp fork,
+        # the verified fastest engine for this model (flat decode with MTP).
+        if "rocmfp4" in name:
+            return ["laurent"]
+        return ["q4exp"]
     # everything else is a llama.cpp-family model: usable by mainline, the
     # StrixHalo Vulkan fork, and the ROCmFPX fork
     return ["llamacpp", "strix", "rocmfpx"]
@@ -574,7 +650,7 @@ class ProcessManager:
         self.watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
 
     def _bin_for(self, runner):
-        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"]}[runner]
+        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"], "q4exp": self.cfg["q4exp_bin"], "laurent": self.cfg["laurent_bin"]}[runner]
 
     def _port_holder(self, port):
         """What is holding a port right now, or None if free.
@@ -1136,6 +1212,8 @@ def main():
     ap.add_argument("--dwarfstar-bin", help="ds4-server binary")
     ap.add_argument("--strix-bin", help="StrixHalo llama.cpp (Vulkan) llama-server binary")
     ap.add_argument("--rocmfpx-bin", help="ROCmFPX llama.cpp (Vulkan/ROCm) llama-server binary")
+    ap.add_argument("--q4exp-bin", help="qwen4exp llama.cpp (Vulkan) llama-server binary")
+    ap.add_argument("--laurent-bin", help="ROCmFP4 llama.cpp (Vulkan) llama-server binary")
     args = ap.parse_args()
     if args.host:
         cfg["host"] = args.host
@@ -1149,6 +1227,10 @@ def main():
         cfg["strix_bin"] = args.strix_bin
     if args.rocmfpx_bin:
         cfg["rocmfpx_bin"] = args.rocmfpx_bin
+    if args.q4exp_bin:
+        cfg["q4exp_bin"] = args.q4exp_bin
+    if args.laurent_bin:
+        cfg["laurent_bin"] = args.laurent_bin
 
     api = API(cfg)
     server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)
