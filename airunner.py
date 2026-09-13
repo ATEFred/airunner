@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import shutil
+import signal
 import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -406,12 +407,12 @@ HALOGEN_OPTS = [
     {"label": "HALOGEN_KV_SLOTS", "key": "HALOGEN_KV_SLOTS", "type": "int", "default": "4",
      "desc": "KV slots over the shared pool (one concurrent session each)", "suggested": "4"},
     {"label": "HALOGEN_KV_POOL_POSITIONS", "key": "HALOGEN_KV_POOL_POSITIONS", "type": "int", "default": "",
-     "desc": "Shared KV pool positions (blank = auto: 2 x HALOGEN_CTX = 524288)", "suggested": ""},
+      "desc": "Shared KV pool positions. Blank = auto (2 x HALOGEN_CTX). If set, must be >= HALOGEN_CTX and a multiple of 256 (e.g. 262144, 327680, 393216, 524288); the engine exits on boot otherwise.", "suggested": ""},
     {"label": "HALOGEN_PROMPT_CACHE", "key": "HALOGEN_PROMPT_CACHE", "type": "choice", "default": "2",
      "choices": ["2", "0"],
      "desc": "Prompt cache (KV kept in RAM across requests for fast followups): 2 = 8 in-place entries (~0.9 GiB, default), 0 = off", "suggested": "2"},
-    {"label": "HALOGEN_CACHE_ENTRIES", "key": "HALOGEN_CACHE_ENTRIES", "type": "int", "default": "8",
-     "desc": "Prompt-cache entries (in-place mode; each ~115 MiB of O(1) state)", "suggested": "8"},
+    {"label": "HALOGEN_CACHE_ENTRIES", "key": "HALOGEN_CACHE_ENTRIES", "type": "int", "default": "32",
+     "desc": "Prompt-cache entries (in-place mode; each ~115 MiB of O(1) state). 8 (image default) thrashes under many active conversations (~30% hit rate measured) -> 10-60 s cold prefills; 32 (~3.7 GiB) keeps them warm, ~0.1 s", "suggested": "32"},
     {"label": "HALOGEN_CK_OVERLAY", "key": "HALOGEN_CK_OVERLAY", "type": "str", "default": "",
      "desc": "Quality overlay .hgn path (blank = auto-detect next to the checkpoint)", "suggested": ""},
     {"label": "HALOGEN_VISION_TOWER", "key": "HALOGEN_VISION_TOWER", "type": "choice", "default": "0",
@@ -688,6 +689,7 @@ class Process:
         self.restarts = 0
         self.started_by_watchdog = False
         self.container = None  # podman container name (halogen runner only)
+        self.stop_requested = False  # set by stop(); survives snapshot races
 
     def to_dict(self):
         return {
@@ -732,6 +734,10 @@ class ProcessManager:
                         and (p.setup.get("port") or "") == str(port):
                     return f"airunner model '{p.setup.get('name') or os.path.basename(p.setup.get('model', ''))}' (pid {p.pid})"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # SO_REUSEADDR so leftover TIME-WAIT sockets from a just-stopped
+        # model don't masquerade as a live holder (a real listener still
+        # refuses the bind either way).
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", port))
             return None
@@ -783,6 +789,21 @@ class ProcessManager:
             proc.log.append("$ " + podman + " run -p " + port + ":8731 ... " + image)
             proc.log.append(f"[airunner] REFUSED to start: port {port} is in use ({holder}). "
                             f"Stop what is holding it, or change this setup's port.")
+            with self.lock:
+                self.procs[proc.id] = proc
+            return proc
+        # the engine hard-exits 2 s into boot on an invalid pool size
+        # (>= CTX and a multiple of 256) — fail fast with a clear message
+        pool = str(opts.get("HALOGEN_KV_POOL_POSITIONS", "") or "").strip()
+        try:
+            ctxv = int(str(opts.get("HALOGEN_CTX", "") or "262144").strip() or 262144)
+        except ValueError:
+            ctxv = 262144
+        if pool and (not pool.isdigit() or int(pool) < ctxv or int(pool) % 256 != 0):
+            proc.status = "stopped"
+            proc.log.append(f"[airunner] REFUSED to start: HALOGEN_KV_POOL_POSITIONS={pool} is invalid. "
+                            f"The engine requires >= CTX ({ctxv}) and a multiple of 256 "
+                            f"(valid: {ctxv}, 327680, 393216, 524288). Leave it empty for the default (2xCTX).")
             with self.lock:
                 self.procs[proc.id] = proc
             return proc
@@ -901,6 +922,9 @@ class ProcessManager:
             if not proc:
                 return False
             self.stop_flags.add(proc.pid)
+            # object-level flag: a watchdog tick that snapshotted this proc
+            # before the pid flag exists still sees it (same object)
+            proc.stop_requested = True
             pidv = proc.pid
         if pidv is None:
             proc.status = "stopped"
@@ -915,6 +939,7 @@ class ProcessManager:
                 proc.status = "stopped"
                 with self.lock:
                     self.procs.pop(proc.id, None)
+                    self.stop_flags.discard(proc.pid)
             if proc.setup.get("runner") == "halogen" and proc.container:
                 # SIGINT to the `podman run` client would orphan the container
                 # (it keeps running detached); stop the container itself first.
@@ -946,6 +971,22 @@ class ProcessManager:
         threading.Thread(target=_kill, daemon=True).start()
         return True
 
+    def _start_with_retries(self, setup):
+        """start() with short retries. Right after a crash, the dying container's
+        port forwarder can still hold the port for a few seconds (teardown
+        window); a refused first attempt used to wedge the proc in "crashed".
+        Returns the live proc, or None if every attempt was refused."""
+        for attempt in range(3):
+            p = self.start(setup)
+            if p is not None and p.pid is not None:
+                return p
+            if p is not None:
+                with self.lock:
+                    self.procs.pop(p.id, None)
+            if attempt < 2:
+                time.sleep(8)
+        return None
+
     def _watchdog_loop(self):
         while True:
             time.sleep(max(1, int(self.cfg.get("watchdog_interval", 5))))
@@ -972,7 +1013,7 @@ class ProcessManager:
                     alive = self._alive(proc.pid)
             if alive:
                 continue
-            if proc.pid in self.stop_flags:
+            if getattr(proc, "stop_requested", False) or proc.pid in self.stop_flags:
                 continue
             # already crashed (and possibly left there after a refused restart):
             # don't hot-loop re-attempts every tick — the UI's Start button
@@ -981,6 +1022,11 @@ class ProcessManager:
             if proc.status == "crashed":
                 continue
             # crashed unexpectedly
+            # re-check on the live object: stop() may have landed between the
+            # snapshot above and this point (the original TOCTOU race)
+            if getattr(proc, "stop_requested", False) or proc.pid in self.stop_flags:
+                proc.status = "stopped"
+                continue
             rc = self._exit_code(proc.pid) if proc.pid else None
             proc.status = "crashed"
             proc.exit_code = rc
@@ -988,7 +1034,7 @@ class ProcessManager:
                 proc.restarts += 1
                 proc.status = "restarting"
                 proc.log.append(f"[airunner] process died (rc={rc}); restarting ({proc.restarts})")
-                new = self.start(proc.setup)
+                new = self._start_with_retries(proc.setup)
                 if new and new.pid is not None:
                     # carry restart count across the fresh Process record
                     new.restarts = proc.restarts
@@ -1409,6 +1455,23 @@ def main():
         cfg["halogen_models_dir"] = args.halogen_models_dir
 
     api = API(cfg)
+
+    def _sigterm(_signum, _frame):
+        # stop our containers before exiting so a service restart/stop never
+        # leaves a halogen container running orphaned (holding its port,
+        # its RAM, and refusing the next start)
+        with api.pm.lock:
+            conts = [p.container for p in api.pm.procs.values()
+                     if p.container and p.status in ("running", "restarting")]
+        for c in conts:
+            try:
+                subprocess.run(["podman", "stop", "-t", "10", c],
+                               capture_output=True, timeout=30)
+            except Exception:
+                pass
+        os._exit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
+
     server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)
     server.api = api
     print(f"airunner: web UI at http://{cfg['host']}:{cfg['port']}")
