@@ -1,9 +1,15 @@
 # Airunner — local model runner manager
 
-Manage and launch the GGUF models on this machine. Supports both runners:
+Manage and launch the models on this machine. Supports these runners:
 
 - **llama.cpp** (`llama-server`) — `/home/fred/ai/llama.cpp/build/bin/llama-server`
 - **DwarfStar** (`ds4-server`) — `/home/fred/dwarfstar/ds4-server`
+- **Halogen** (`halogen-flash-server` podman container, ROCm engine) — weights in
+  `/home/fred/halogen-models` (`.hgn` checkpoint + overlays). Runs as a managed
+  podman container: the API port is a host:8731 mapping and every launch option
+  is a `HALOGEN_*` environment variable (context, KV slots/pool, prompt cache,
+  vision tower, sampling defaults, …). Stop = `podman stop`, so no orphaned
+  containers.
 
 Zero dependencies: Python 3 stdlib backend + a single-page vanilla JS frontend.
 

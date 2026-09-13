@@ -44,6 +44,9 @@ DEFAULT_CONFIG = {
     "rocmfpx_bin": "/home/fred/ai/rocmfpx-llamacpp/build-strix-rocmfp4/bin/llama-server",
     "q4exp_bin": "/home/fred/ai/qwen4exp-llamacpp/build-vk/bin/llama-server",
     "laurent_bin": "/home/fred/ai/rocmfp4-q4exp-llamacpp/build-vk/bin/llama-server",
+    "halogen_bin": "podman",
+    "halogen_image": "ghcr.io/peonist-ai/halogen-flash-server:0.6.1",
+    "halogen_models_dir": "/home/fred/halogen-models",
     "model_dirs": ["/home/fred/ai/models", DWARFSTAR_GGUF_DIR],
     "host": "127.0.0.1",
     "port": 8090,
@@ -57,6 +60,7 @@ RUNNER_LABEL = {
     "rocmfpx": "ROCmFPX llama.cpp (Vulkan/ROCm)",
     "q4exp": "qwen4exp llama.cpp (Vulkan, MTP sidecar)",
     "laurent": "ROCmFP4 llama.cpp (Vulkan, qwen4exp)",
+    "halogen": "Halogen (halogen-flash-server container, ROCm)",
 }
 
 # ---------------------------------------------------------------------------
@@ -384,7 +388,53 @@ ROCMFPX_OPTS = [
      "desc": "Enable prometheus-compatible /metrics endpoint", "suggested": "on"},
 ]
 
-RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS, "rocmfpx": ROCMFPX_OPTS, "q4exp": Q4EXP_OPTS, "laurent": LAURENT_OPTS}
+# Halogen (peonist-ai/halogen-flash-server): a podman container, not a bare
+# binary — "options" are HALOGEN_* environment variables (keys are the env var
+# names) and the model comes from the weights volume, not a -m path.
+# Defaults below are the image's 0.6.1 entrypoint defaults; "suggested" is the
+# measured Strix Halo / Qwen3.8-Flash-Next config (bench 2026-09: prefill
+# 1.35-8.5x and warm followup 4x faster than the q4exp llama.cpp path).
+# NOTE: only one ~100 GiB model fits at a time (124 GiB unified RAM) — with
+# halogen up, the llama.cpp models are out of RAM and vice versa.
+HALOGEN_OPTS = [
+    {"label": "--port", "key": "port", "type": "int", "default": "8731", "no_cli": True,
+     "desc": "Host API port (mapped to the container's 8731)", "suggested": "8731"},
+    {"label": "HALOGEN_CTX", "key": "HALOGEN_CTX", "type": "int", "default": "262144",
+     "desc": "Engine context (max tokens one request may use); past the native 262144 needs HALOGEN_ROPE_YARN", "suggested": "262144"},
+    {"label": "HALOGEN_MAX_TOK", "key": "HALOGEN_MAX_TOK", "type": "int", "default": "32768",
+     "desc": "Single-call prefill arena (tokens; 32768 = ~16.7 GiB). This box's practical ceiling: 68 GiB of resident weights + ~35 GiB KV pool leave ~37 GiB device budget, so 65536/131072 OOM here. Longer prefills are chunked across arena passes (the 262k bench ran at 32768).", "suggested": "32768"},
+    {"label": "HALOGEN_KV_SLOTS", "key": "HALOGEN_KV_SLOTS", "type": "int", "default": "4",
+     "desc": "KV slots over the shared pool (one concurrent session each)", "suggested": "4"},
+    {"label": "HALOGEN_KV_POOL_POSITIONS", "key": "HALOGEN_KV_POOL_POSITIONS", "type": "int", "default": "",
+     "desc": "Shared KV pool positions (blank = auto: 2 x HALOGEN_CTX = 524288)", "suggested": ""},
+    {"label": "HALOGEN_PROMPT_CACHE", "key": "HALOGEN_PROMPT_CACHE", "type": "choice", "default": "2",
+     "choices": ["2", "0"],
+     "desc": "Prompt cache (KV kept in RAM across requests for fast followups): 2 = 8 in-place entries (~0.9 GiB, default), 0 = off", "suggested": "2"},
+    {"label": "HALOGEN_CACHE_ENTRIES", "key": "HALOGEN_CACHE_ENTRIES", "type": "int", "default": "8",
+     "desc": "Prompt-cache entries (in-place mode; each ~115 MiB of O(1) state)", "suggested": "8"},
+    {"label": "HALOGEN_CK_OVERLAY", "key": "HALOGEN_CK_OVERLAY", "type": "str", "default": "",
+     "desc": "Quality overlay .hgn path (blank = auto-detect next to the checkpoint)", "suggested": ""},
+    {"label": "HALOGEN_VISION_TOWER", "key": "HALOGEN_VISION_TOWER", "type": "choice", "default": "0",
+     "choices": ["0", "1"],
+     "desc": "Vision sidecar for image inputs (1 = on; costs ~1.9 GiB and ~5.5 s per 1280x800 image)", "suggested": "1"},
+    {"label": "HALOGEN_VISION_MAX_PIXELS", "key": "HALOGEN_VISION_MAX_PIXELS", "type": "int", "default": "3686400",
+     "desc": "Max image pixels (W*H product; 3686400 = 2560x1440; larger images are downscaled)", "suggested": "3686400"},
+    {"label": "HALOGEN_DOWNLOAD", "key": "HALOGEN_DOWNLOAD", "type": "str", "default": "",
+     "desc": "HF repo to fetch missing weights from on first start (blank = off; weights dir must be writable)", "suggested": ""},
+    {"label": "HALOGEN_TEMPERATURE", "key": "HALOGEN_TEMPERATURE", "type": "str", "default": "",
+     "desc": "API default sampling temperature (blank = greedy)", "suggested": ""},
+    {"label": "HALOGEN_TOP_P", "key": "HALOGEN_TOP_P", "type": "str", "default": "",
+     "desc": "API default top-p (blank = engine default)", "suggested": ""},
+    {"label": "HALOGEN_TOP_K", "key": "HALOGEN_TOP_K", "type": "str", "default": "",
+     "desc": "API default top-k (blank = engine default)", "suggested": ""},
+    {"label": "HALOGEN_REASONING_EFFORT", "key": "HALOGEN_REASONING_EFFORT", "type": "choice", "default": "xhigh",
+     "choices": ["xhigh", "high", "medium", "low"],
+     "desc": "API default reasoning depth (the engine's own default is xhigh; lower = faster, shorter thinking)", "suggested": "xhigh"},
+    {"label": "HALOGEN_MAX_TOKENS_DEFAULT", "key": "HALOGEN_MAX_TOKENS_DEFAULT", "type": "str", "default": "",
+     "desc": "Default max output tokens when clients omit a limit (blank = engine default)", "suggested": ""},
+]
+
+RUNNER_OPTS = {"llamacpp": LLAMACPP_OPTS, "dwarfstar": DWARFSTAR_OPTS, "strix": STRIX_OPTS, "rocmfpx": ROCMFPX_OPTS, "q4exp": Q4EXP_OPTS, "laurent": LAURENT_OPTS, "halogen": HALOGEN_OPTS}
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +553,10 @@ def model_defaults_for(models):
 # ---------------------------------------------------------------------------
 
 def model_runner_of(model_path):
+    # Halogen weights are .hgn files (checkpoint + overlays + vision tower);
+    # only the main checkpoint is launchable.
+    if os.path.basename(model_path).endswith(".hgn"):
+        return ["halogen"]
     if os.path.dirname(os.path.abspath(model_path)) == os.path.abspath(DWARFSTAR_GGUF_DIR):
         return ["dwarfstar"]
     # Qwen3.8-Flash-Next (qwen4exp): only the q4exp fork can load its MTP sidecar;
@@ -524,6 +578,19 @@ def model_runner_of(model_path):
 
 def option_cli_args(runner, opts):
     """Convert {key: value} option dict to CLI argument list."""
+    if runner == "halogen":
+        # halogen options are HALOGEN_* environment variables, not flags
+        args = []
+        for o in RUNNER_OPTS[runner]:
+            key = o["key"]
+            if key not in opts or o.get("no_cli"):
+                continue
+            v = opts[key]
+            if v is None or v == "":
+                continue
+            args.append("-e")
+            args.append(f"{key}={v}")
+        return args
     args = []
     for o in RUNNER_OPTS[runner]:
         key = o["key"]
@@ -620,6 +687,7 @@ class Process:
         self.log = deque(maxlen=2000)
         self.restarts = 0
         self.started_by_watchdog = False
+        self.container = None  # podman container name (halogen runner only)
 
     def to_dict(self):
         return {
@@ -628,6 +696,7 @@ class Process:
             "name": self.setup.get("name") or os.path.basename(self.setup.get("model", "")),
             "runner": self.setup.get("runner"),
             "model": self.setup.get("model"),
+            "container": self.container,
             "port": self.setup.get("port") or "",
             "status": self.status,
             "exit_code": self.exit_code,
@@ -650,7 +719,8 @@ class ProcessManager:
         self.watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
 
     def _bin_for(self, runner):
-        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"], "q4exp": self.cfg["q4exp_bin"], "laurent": self.cfg["laurent_bin"]}[runner]
+        return {"llamacpp": self.cfg["llamacpp_bin"], "dwarfstar": self.cfg["dwarfstar_bin"], "strix": self.cfg["strix_bin"], "rocmfpx": self.cfg["rocmfpx_bin"], "q4exp": self.cfg["q4exp_bin"], "laurent": self.cfg["laurent_bin"],
+                "halogen": self.cfg.get("halogen_bin", "podman")}[runner]
 
     def _port_holder(self, port):
         """What is holding a port right now, or None if free.
@@ -683,8 +753,73 @@ class ProcessManager:
             pass
         proc.dead = True
 
+    def _start_halogen(self, setup):
+        """Halogen is a podman container (ROCm engine + FastAPI gateway), not a
+        bare binary: the model comes from the weights volume, the API port is a
+        -p host:8731 mapping, and every option is a -e HALOGEN_* env var.
+        The container runs in the foreground of the `podman run` client so the
+        usual reader-thread / watchdog / stop machinery applies unchanged."""
+        podman = self._bin_for("halogen")
+        image = self.cfg.get("halogen_image", "ghcr.io/peonist-ai/halogen-flash-server:0.6.1")
+        mdir = self.cfg.get("halogen_models_dir", "")
+        opts = setup.get("options", {})
+        pk = port_opt_key("halogen")
+        port = str(opts.get(pk, "") or "") if pk else ""
+        proc = Process(None, setup)
+        proc.setup["port"] = port
+        ckpt = halogen_model_path(self.cfg)
+        if not ckpt:
+            proc.status = "stopped"
+            proc.log.append(f"[airunner] REFUSED: no halogen checkpoint (*.hgn) found in {mdir or '<unset halogen_models_dir>'}. "
+                            "Download the weights (e.g. HALOGEN_DOWNLOAD) or fix the weights dir in Config.")
+            with self.lock:
+                self.procs[proc.id] = proc
+            return proc
+        if not (port and port.isdigit()):
+            port = "8731"
+        holder = self._port_holder(int(port))
+        if holder:
+            proc.status = "stopped"
+            proc.log.append("$ " + podman + " run -p " + port + ":8731 ... " + image)
+            proc.log.append(f"[airunner] REFUSED to start: port {port} is in use ({holder}). "
+                            f"Stop what is holding it, or change this setup's port.")
+            with self.lock:
+                self.procs[proc.id] = proc
+            return proc
+        name = "airunner-halogen-" + uuid.uuid4().hex[:10]
+        # writable volume only when a weight download is requested
+        vmode = ":rw" if str(opts.get("HALOGEN_DOWNLOAD", "") or "").strip() else ":ro"
+        args = [podman, "run", "--rm", "--name", name,
+                "-p", f"{port}:8731",
+                "--device", "/dev/kfd", "--device", "/dev/dri",
+                "--group-add", "keep-groups",
+                "--ipc", "host",
+                "--ulimit", "memlock=-1:-1",
+                "-v", f"{mdir}:/models{vmode}"]
+        args += option_cli_args("halogen", opts)
+        args.append(image)
+        with self.lock:
+            self.procs[proc.id] = proc
+        proc.container = name
+        try:
+            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, env=dict(os.environ))
+            proc.pid = p.pid
+            proc.stdout = p.stdout
+            proc.log.append("$ " + " ".join(args))
+            r = threading.Thread(target=self._reader, args=(p.pid, proc), daemon=True)
+            proc.reader = r
+            self.readers[p.pid] = r
+            r.start()
+        except Exception as e:
+            proc.status = "crashed"
+            proc.log.append(f"[airunner] failed to launch: {e}")
+        return proc
+
     def start(self, setup):
         runner = setup["runner"]
+        if runner == "halogen":
+            return self._start_halogen(setup)
         binary = self._bin_for(runner)
         model = setup.get("model", "")
         args = [binary]
@@ -780,6 +915,15 @@ class ProcessManager:
                 proc.status = "stopped"
                 with self.lock:
                     self.procs.pop(proc.id, None)
+            if proc.setup.get("runner") == "halogen" and proc.container:
+                # SIGINT to the `podman run` client would orphan the container
+                # (it keeps running detached); stop the container itself first.
+                # --rm then cleans it up and the client exits on its own.
+                try:
+                    subprocess.run([self._bin_for("halogen"), "stop", "-t", "10", proc.container],
+                                   capture_output=True, timeout=60)
+                except Exception:
+                    pass
             try:
                 os.kill(pidv, 2)  # SIGINT
             except Exception:
@@ -829,6 +973,12 @@ class ProcessManager:
             if alive:
                 continue
             if proc.pid in self.stop_flags:
+                continue
+            # already crashed (and possibly left there after a refused restart):
+            # don't hot-loop re-attempts every tick — the UI's Start button
+            # (or a fixed port) brings it back. Only "running"/"restarting"
+            # procs die into a crash.
+            if proc.status == "crashed":
                 continue
             # crashed unexpectedly
             rc = self._exit_code(proc.pid) if proc.pid else None
@@ -945,6 +1095,19 @@ def discover_models(dirs):
     return found
 
 
+def halogen_model_path(cfg):
+    """The launchable halogen checkpoint (.hgn) in the configured weights dir,
+    or "" if the dir is missing/empty. Overlays and the vision tower are not
+    launchable on their own."""
+    d = cfg.get("halogen_models_dir", "")
+    if not d or not os.path.isdir(d):
+        return ""
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".hgn") and "overlay" not in name and "vision" not in name:
+            return os.path.join(d, name)
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
@@ -986,7 +1149,11 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/state":
             return self._send(200, api.state())
         if route == "/api/models":
-            return self._send(200, {"models": discover_models(api.cfg.get("model_dirs", []))})
+            models = discover_models(api.cfg.get("model_dirs", []))
+            hm = halogen_model_path(api.cfg)
+            if hm and hm not in models:
+                models.append(hm)
+            return self._send(200, {"models": models})
         if route == "/api/config":
             return self._send(200, api.cfg)
         if route == "/api/setups":
@@ -1089,6 +1256,9 @@ class API:
         with self.pm.lock:
             procs = [p.to_dict() for p in self.pm.procs.values()]
         models = discover_models(self.cfg.get("model_dirs", []))
+        hm = halogen_model_path(self.cfg)
+        if hm and hm not in models:
+            models.append(hm)
         return {
             "config": self.cfg,
             "setups": self.store.get("setups", []),
@@ -1214,6 +1384,8 @@ def main():
     ap.add_argument("--rocmfpx-bin", help="ROCmFPX llama.cpp (Vulkan/ROCm) llama-server binary")
     ap.add_argument("--q4exp-bin", help="qwen4exp llama.cpp (Vulkan) llama-server binary")
     ap.add_argument("--laurent-bin", help="ROCmFP4 llama.cpp (Vulkan) llama-server binary")
+    ap.add_argument("--halogen-image", help="halogen-flash-server container image")
+    ap.add_argument("--halogen-models-dir", help="halogen weights directory (.hgn checkpoint + overlays)")
     args = ap.parse_args()
     if args.host:
         cfg["host"] = args.host
@@ -1231,6 +1403,10 @@ def main():
         cfg["q4exp_bin"] = args.q4exp_bin
     if args.laurent_bin:
         cfg["laurent_bin"] = args.laurent_bin
+    if args.halogen_image:
+        cfg["halogen_image"] = args.halogen_image
+    if args.halogen_models_dir:
+        cfg["halogen_models_dir"] = args.halogen_models_dir
 
     api = API(cfg)
     server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), Handler)

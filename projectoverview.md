@@ -7,10 +7,26 @@
 
 Airunner is a **local model runner manager** for this machine (`halo-server`,
 CachyOS/Arch Linux). It is a small web app that lets the user launch, manage,
-watch, and auto-restart the GGUF models stored locally. It supports two runners:
+watch, and auto-restart the models stored locally. It supports these runners:
 
 - **llama.cpp** → `llama-server` (`/home/fred/ai/llama.cpp/build/bin/llama-server`)
 - **DwarfStar** → `ds4-server` (`/home/fred/dwarfstar/ds4-server`)
+- **Halogen** → `halogen-flash-server` podman container (ROCm engine), weights
+  in `/home/fred/halogen-models` (`.hgn` checkpoint + overlays + vision tower).
+  Launched via `ProcessManager._start_halogen()`: `podman run --rm -p <port>:8731
+  --device /dev/kfd --device /dev/dri --group-add keep-groups --ipc=host
+  --ulimit memlock=-1:-1 -v <weights>:/models:ro -e HALOGEN_*=... <image>` in the
+  FOREGROUND (no `-d`), so the reader-thread/watchdog/stop machinery is unchanged.
+  `HALOGEN_OPTS` keys ARE the env var names; `option_cli_args("halogen", ...)`
+  renders them as `-e KEY=VALUE`. Stop sends `podman stop` FIRST (killing the
+  `podman run` client alone would orphan the container). The launchable model is
+  a pseudo-entry: the single non-overlay/non-vision `.hgn` checkpoint
+  (`halogen_model_path()`), mapped to `["halogen"]` by `model_runner_of()`.
+  Benchmarked 2026-09 vs the q4exp llama.cpp path on Qwen3.8-Flash-Next:
+  prefill 1.35–8.5× faster (1277 vs 192 t/s @100k), warm followup 0.98s vs 3.99s
+  @100k, decode ~tied, quality equal-or-better (5.53 bpw vs 3.71 bpw quant).
+  NOTE: only one ~100 GiB model at a time (124 GiB unified RAM) — halogen holds
+  ~112 GiB while up.
 
 It is intentionally **zero-dependency**: the backend is Python 3 stdlib (no pip
 packages are installed on this box) and the frontend is a single vanilla-JS
@@ -18,9 +34,10 @@ HTML file. There is no `pip`, so keep it stdlib-only.
 
 ## What it provides (feature list)
 
-- Launch models from either runner with any of that runner's launch options.
+- Launch models from any runner with any of that runner's launch options.
 - Per-runner **launch-option table**: every option, its default, and a suggested
-  value, editable before launch. For both runners.
+  value, editable before launch. For all runners (halogen's table is the
+  `HALOGEN_*` env vars).
 - **Parallel models**: many models running at once; each has its own process,
   output console, Stop button.
 - **Live output console** per running model (streams stdout/stderr).
@@ -30,8 +47,9 @@ HTML file. There is no `pip`, so keep it stdlib-only.
   installs a systemd *user* service, and on boot auto-launches autostart setups.
 - **Restart on crash** (watchdog): a setup marked "restart on crash" is
   relaunched whenever its process dies; restart count shown per model.
-- **Config panel** to point at the llama.cpp / DwarfStar binaries and the model
-  directories scanned for `.gguf` files.
+- **Config panel** to point at the llama.cpp / DwarfStar binaries, the halogen
+  container image + weights dir, and the model directories scanned for `.gguf`
+  files.
 - **Port policy**: the configured port is used exactly as set. If it is taken
   (by another airunner model or any other live process), the launch is refused and
   the reason is shown. Stopped/removed entries never reserve a port.

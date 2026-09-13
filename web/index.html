@@ -85,6 +85,10 @@
       <input id="cfg-q4exp" placeholder="/path/to/qwen4exp llama-server">
       <label>ROCmFP4 llama.cpp binary (llama-server, Vulkan)</label>
       <input id="cfg-laurent" placeholder="/path/to/rocmfp4 llama-server">
+      <label>Halogen container image (podman)</label>
+      <input id="cfg-halogen-image" placeholder="ghcr.io/peonist-ai/halogen-flash-server:0.6.1">
+      <label>Halogen weights directory (.hgn checkpoint + overlays)</label>
+      <input id="cfg-halogen-models" placeholder="/home/fred/halogen-models">
       <label>Model directories (comma-separated)</label>
       <input id="cfg-models" placeholder="/path/to/models">
       <div class="row">
@@ -109,6 +113,7 @@
         <option value="rocmfpx">ROCmFPX llama.cpp (Vulkan/ROCm)</option>
         <option value="q4exp">qwen4exp llama.cpp (Vulkan, MTP)</option>
         <option value="laurent">ROCmFP4 llama.cpp (Vulkan, qwen4exp)</option>
+        <option value="halogen">Halogen (container, ROCm)</option>
         <option value="dwarfstar">DwarfStar (ds4-server)</option>
       </select>
       <label>Model</label>
@@ -268,11 +273,13 @@ function buildSetup(){
   runnerOpts(runner).forEach(o => {
     if(optVals[runner] && optVals[runner][o.key] != null) opts[o.key] = optVals[runner][o.key];
   });
+  // bookkeeping port follows the runner's --port option when left blank
+  const bookPort = $("port").value || (opts.port != null && opts.port !== "" ? String(opts.port) : "");
   return {
     runner, model: selectedModel, options: opts,
     autostart: $("autostart").checked,
     restart_on_crash: $("restart").checked,
-    port: $("port").value,
+    port: bookPort,
   };
 }
 
@@ -294,7 +301,7 @@ function renderProcs(){
     name.className = "proc-header";
     name.innerHTML = `<span class="name">${esc(p.name)}</span>
       <span class="badge ${p.status}">${p.status}</span>
-      <span class="meta">pid ${p.pid} · runner ${p.runner} · ${p.uptime}s · restarts ${p.restarts}</span>`;
+      <span class="meta">pid ${p.pid} · runner ${p.runner}${p.container ? " · " + p.container : ""} · ${p.uptime}s · restarts ${p.restarts}</span>`;
     const console = document.createElement("div");
     console.className = "console";
     console.id = "console-"+p.id;
@@ -445,6 +452,8 @@ async function refresh(){
   $("cfg-rocmfpx").value = state.config.rocmfpx_bin || "";
   $("cfg-q4exp").value = state.config.q4exp_bin || "";
   $("cfg-laurent").value = state.config.laurent_bin || "";
+  $("cfg-halogen-image").value = state.config.halogen_image || "";
+  $("cfg-halogen-models").value = state.config.halogen_models_dir || "";
   $("cfg-models").value = (state.config.model_dirs||[]).join(", ");
   $("cfg-host").value = state.config.host || "";
   $("cfg-port").value = state.config.port || "";
@@ -492,6 +501,8 @@ document.addEventListener("DOMContentLoaded", () => {
       rocmfpx_bin: $("cfg-rocmfpx").value.trim(),
       q4exp_bin: $("cfg-q4exp").value.trim(),
       laurent_bin: $("cfg-laurent").value.trim(),
+      halogen_image: $("cfg-halogen-image").value.trim(),
+      halogen_models_dir: $("cfg-halogen-models").value.trim(),
       model_dirs: $("cfg-models").value.split(",").map(s=>s.trim()).filter(Boolean),
       host: $("cfg-host").value.trim(), port: parseInt($("cfg-port").value)||8090,
       watchdog_interval: parseInt($("cfg-wd").value)||5,
